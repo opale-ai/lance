@@ -836,7 +836,6 @@ async fn configure_store(
         "az" => {
             storage_options.with_env_azure();
             let mut builder = MicrosoftAzureBuilder::new().with_url(url.as_ref());
-            println!("{}", builder);
             for (key, value) in storage_options.as_azure_options() {
                 builder = builder.with_config(key, value);
             }
