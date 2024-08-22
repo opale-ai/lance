@@ -3,7 +3,6 @@
 
 //! Extend [object_store::ObjectStore] functionalities
 
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
