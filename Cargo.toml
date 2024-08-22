@@ -123,7 +123,7 @@ moka = { version = "0.11", features = ["future"] }
 num-traits = "0.2"
 num_cpus = "1.0"
 # Set min to prevent use of versions with CVE-2024-41178
-object_store = { version = "0.10.2" }
+object_store = { path = "../arrow-rs/object_store" }
 parquet = "52.0"
 pin-project = "1.0"
 path_abs = "0.5"

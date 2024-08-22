@@ -3,6 +3,7 @@
 
 //! Extend [object_store::ObjectStore] functionalities
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -16,16 +17,19 @@ use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+
 use object_store::aws::{
-    AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
+    AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
+    AwsCredentialProvider,
 };
-use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::{
-    aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
-    memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
+    local::LocalFileSystem, memory::InMemory, CredentialProvider, Error as ObjectStoreError,
+    Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+use object_store::{ClientOptions, DynObjectStore, StaticCredentialProvider};
 use shellexpand::tilde;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
@@ -795,7 +799,6 @@ async fn configure_store(
 
             url.set_query(None);
 
-            // we can't use parse_url_opts here because we need to manually set the credentials provider
             let mut builder = AmazonS3Builder::new();
             for (key, value) in storage_options {
                 builder = builder.with_config(key, value);
@@ -822,7 +825,6 @@ async fn configure_store(
             }
             let store = builder.build()?;
             let store = Arc::new(store);
-
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
@@ -833,9 +835,13 @@ async fn configure_store(
         }
         "az" => {
             storage_options.with_env_azure();
-            let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
+            let mut builder = MicrosoftAzureBuilder::new().with_url(url.as_ref());
+            println!("{}", builder);
+            for (key, value) in storage_options.as_azure_options() {
+                builder = builder.with_config(key, value);
+            }
+            let store = builder.build()?;
             let store = Arc::new(store);
-
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
