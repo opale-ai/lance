@@ -4,7 +4,7 @@
 //! Secondary Index
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -19,9 +19,10 @@ use lance_index::scalar::expression::{
     IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ScalarIndex;
+use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
@@ -40,6 +41,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
+use scalar::{build_inverted_index, detect_scalar_index_type};
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -239,6 +241,18 @@ impl DatasetIndexExt for Dataset {
                     })?;
                 build_scalar_index(self, column, &index_id.to_string(), params).await?;
             }
+            (IndexType::Inverted, _) => {
+                // Inverted index params.
+                let inverted_params = params
+                    .as_any()
+                    .downcast_ref::<InvertedIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
+                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
+            }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
                 let vec_params = params
@@ -310,6 +324,7 @@ impl DatasetIndexExt for Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -379,6 +394,7 @@ impl DatasetIndexExt for Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -409,8 +425,17 @@ impl DatasetIndexExt for Dataset {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 
+        let indices_to_optimize = options
+            .index_names
+            .as_ref()
+            .map(|names| names.iter().collect::<HashSet<_>>());
         let name_to_indices = indices
             .iter()
+            .filter(|idx| {
+                indices_to_optimize
+                    .as_ref()
+                    .map_or(true, |names| names.contains(&idx.name))
+            })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
 
@@ -465,6 +490,7 @@ impl DatasetIndexExt for Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -649,8 +675,13 @@ impl DatasetIndexInternalExt for Dataset {
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
                 let file = scheduler.open_file(&index_file).await?;
-                let reader =
-                    v2::reader::FileReader::try_open(file, None, Default::default()).await?;
+                let reader = v2::reader::FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &self.session.file_metadata_cache,
+                )
+                .await?;
                 let index_metadata = reader
                     .schema()
                     .metadata
@@ -675,7 +706,7 @@ impl DatasetIndexInternalExt for Dataset {
                     });
                 }?;
                 match index_metadata.index_type.as_str() {
-                    "FLAT" => match value_type {
+                    "IVF_FLAT" => match value_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
                                 self.object_store.clone(),
@@ -695,8 +726,30 @@ impl DatasetIndexInternalExt for Dataset {
                         }),
                     },
 
-                    "HNSW" => {
+                    "IVF_PQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_HNSW_PQ" => {
+                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
@@ -727,22 +780,41 @@ impl DatasetIndexInternalExt for Dataset {
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
-        let indexed_fields = indices
-        .iter()
-        .filter(|idx| idx.fields.len() == 1)
-        .map(|idx| {
-            let field = idx.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
-            field.map(|field| {
-                let query_parser = if let DataType::List(_) = field.data_type() {
+        let mut indexed_fields = Vec::new();
+        for index in indices.iter().filter(|idx| {
+            let idx_schema = schema.project_by_ids(idx.fields.as_slice());
+            let is_vector_index = idx_schema
+                .fields
+                .iter()
+                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+            idx.fields.len() == 1 && !is_vector_index
+        }) {
+            let field = index.fields[0];
+            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Index referenced a field with id {field} which did not exist in the schema"
+                ),
+                location: location!(),
+            })?;
+
+            let query_parser = match field.data_type() {
+                DataType::List(_) => {
                     Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
-                } else {
+                }
+                DataType::Utf8 | DataType::LargeUtf8 => {
+                    let uuid = index.uuid.to_string();
+                    let index_type = detect_scalar_index_type(self, &field.name, &uuid).await?;
+                    // Inverted index can't be used for filtering
+                    if matches!(index_type, ScalarIndexType::Inverted) {
+                        continue;
+                    }
                     Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
-                };
-                (field.name.clone(), (field.data_type(), query_parser))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+                }
+                _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
+            };
+
+            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+        }
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
@@ -913,7 +985,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let dimensions = 16;
         let column_name = "vec";
-        let field = Field::new(
+        let vec_field = Field::new(
             column_name,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
@@ -921,14 +993,25 @@ mod tests {
             ),
             false,
         );
-        let schema = Arc::new(Schema::new(vec![field]));
+        let other_column_name = "other_vec";
+        let other_vec_field = Field::new(
+            other_column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![vec_field, other_vec_field]));
 
         let float_arr = generate_random_array(512 * dimensions as usize);
 
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let vectors = Arc::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap(),
+        );
 
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let record_batch =
+            RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()]).unwrap();
 
         let reader = RecordBatchIterator::new(
             vec![record_batch.clone()].into_iter().map(Ok),
@@ -943,6 +1026,16 @@ mod tests {
                 &[column_name],
                 IndexType::Vector,
                 Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &[other_column_name],
+                IndexType::Vector,
+                Some("other_vec_idx".into()),
                 &params,
                 true,
             )
@@ -970,7 +1063,48 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,   // Just create index for delta
+                index_names: Some(vec![]), // Optimize nothing
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        // optimize the other index
+        dataset
+            .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0, // Just create index for delta
+                index_names: Some(vec!["other_vec_idx".to_string()]),
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("other_vec_idx").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0, // Just create index for delta
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -987,6 +1121,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 2,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1071,6 +1206,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0, // Just create index for delta
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1086,6 +1222,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 2,
+                ..Default::default()
             })
             .await
             .unwrap();

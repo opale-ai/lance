@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeSet, io::Cursor, ops::Range, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Cursor,
+    ops::Range,
+    pin::Pin,
+    sync::Arc,
+};
 
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use deepsize::{Context, DeepSizeOf};
-use futures::{
-    stream::{self, BoxStream},
-    Stream, StreamExt,
-};
+use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
-        BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMiddlewareChain,
-        FilterExpression, PageInfo, ReadBatchTask,
+        schedule_and_decode, ColumnInfo, DecoderMiddlewareChain, FilterExpression, PageInfo,
+        ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
@@ -25,6 +28,7 @@ use prost::{Message, Name};
 use snafu::{location, Location};
 
 use lance_core::{
+    cache::FileMetadataCache,
     datatypes::{Field, Schema},
     Error, Result,
 };
@@ -34,7 +38,6 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
     ReadBatchParams,
 };
-use tokio::sync::mpsc;
 
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
@@ -116,14 +119,131 @@ impl CachedFileMetadata {
 /// representations of the same semantic type.  An encoding could
 /// theoretically support "casting" (e.g. int to string,  etc.) but
 /// there is little advantage in doing so here.
+///
+/// Note: in order to specify a projection the user will need some way
+/// to figure out the column indices.  In the table format we do this
+/// using field IDs and keeping track of the field id->column index mapping.
+///
+/// If users are not using the table format then they will need to figure
+/// out some way to do this themselves.
 #[derive(Debug, Clone)]
 pub struct ReaderProjection {
     /// The data types (schema) of the selected columns.  The names
     /// of the schema are arbitrary and ignored.
     pub schema: Arc<Schema>,
-    /// The indices of the columns to load.  Note, these are the
-    /// indices of the top level fields only
+    /// The indices of the columns to load.
+    ///
+    /// The mapping should be as follows:
+    ///
+    /// - Primitive: the index of the column in the schema
+    /// - List: the index of the list column in the schema
+    ///         followed by the column indices of the children
+    /// - FixedSizeList (of primitive): the index of the column in the schema
+    ///         (this case is not nested)
+    /// - FixedSizeList (of non-primitive): not yet implemented
+    /// - Dictionary: same as primitive
+    /// - Struct: the index of the struct column in the schema
+    ///          followed by the column indices of the children
+    ///
+    /// In other words, this should be a DFS listing of the desired schema.
+    ///
+    /// For example, if the goal is to load:
+    ///
+    ///   x: int32
+    ///   y: struct<z: int32, w: string>
+    ///   z: list<int32>
+    ///
+    /// and the schema originally used to store the data was:
+    ///
+    ///   a: struct<x: int32>
+    ///   b: int64
+    ///   y: struct<z: int32, c: int64, w: string>
+    ///   z: list<int32>
+    ///
+    /// Then the column_indices should be [1, 3, 4, 6, 7, 8]
     pub column_indices: Vec<u32>,
+}
+
+impl ReaderProjection {
+    fn from_field_ids_helper<'a>(
+        fields: impl Iterator<Item = &'a Field>,
+        field_id_to_column_index: &BTreeMap<u32, u32>,
+        column_indices: &mut Vec<u32>,
+    ) -> Result<()> {
+        for field in fields {
+            let column_idx = *field_id_to_column_index.get(&(field.id as u32)).ok_or_else(|| Error::InvalidInput {
+                location: location!(),
+                source: format!("the schema referenced a field with id {} which was not in the data file's metadata", field.id).into(),
+            })?;
+            column_indices.push(column_idx);
+            Self::from_field_ids_helper(
+                field.children.iter(),
+                field_id_to_column_index,
+                column_indices,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Creates a projection using a mapping from field IDs to column indices
+    ///
+    /// You can obtain such a mapping when the file is written using the
+    /// [`crate::v2::writer::FileWriter::field_id_to_column_indices`] method.
+    pub fn from_field_ids(
+        schema: &Schema,
+        field_id_to_column_index: &BTreeMap<u32, u32>,
+    ) -> Result<Self> {
+        let mut column_indices = Vec::new();
+        Self::from_field_ids_helper(
+            schema.fields.iter(),
+            field_id_to_column_index,
+            &mut column_indices,
+        )?;
+        Ok(Self {
+            schema: Arc::new(schema.clone()),
+            column_indices,
+        })
+    }
+
+    /// Creates a projection that reads the entire file
+    ///
+    /// If the schema provided is not the schema of the entire file then
+    /// the projection will be invalid and the read will fail.
+    pub fn from_whole_schema(schema: &Schema) -> Self {
+        let schema = Arc::new(schema.clone());
+        let column_indices = schema
+            .fields_pre_order()
+            .enumerate()
+            .map(|(idx, _)| idx as u32)
+            .collect::<Vec<_>>();
+        Self {
+            schema,
+            column_indices,
+        }
+    }
+
+    /// Creates a projection that reads the specified columns provided by name
+    ///
+    /// The syntax for column names is the same as [`lance_core::datatypes::Schema::project`]
+    ///
+    /// If the schema provided is not the schema of the entire file then
+    /// the projection will be invalid and the read will fail.
+    pub fn from_column_names(schema: &Schema, column_names: &[&str]) -> Result<Self> {
+        let field_id_to_column_index = schema
+            .fields_pre_order()
+            .enumerate()
+            .map(|(idx, field)| (field.id as u32, idx as u32))
+            .collect::<BTreeMap<_, _>>();
+        let projected = schema.project(column_names)?;
+        let column_indices = projected
+            .fields_pre_order()
+            .map(|f| field_id_to_column_index[&(f.id as u32)])
+            .collect::<Vec<_>>();
+        Ok(Self {
+            schema: Arc::new(projected),
+            column_indices,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -133,7 +253,8 @@ pub struct FileReader {
     base_projection: ReaderProjection,
     num_rows: u64,
     metadata: Arc<CachedFileMetadata>,
-    decoder_strategy: DecoderMiddlewareChain,
+    decoder_strategy: Arc<DecoderMiddlewareChain>,
+    cache: Arc<FileMetadataCache>,
 }
 
 #[derive(Debug)]
@@ -464,9 +585,6 @@ impl FileReader {
                 location!(),
             ));
         }
-        if projection.schema.fields.len() != projection.column_indices.len() {
-            return Err(Error::invalid_input(format!("The projection schema has {} top level fields but only {} column indices were provided", projection.schema.fields.len(), projection.column_indices.len()), location!()));
-        }
         let mut column_indices_seen = BTreeSet::new();
         for column_index in &projection.column_indices {
             if !column_indices_seen.insert(*column_index) {
@@ -485,40 +603,6 @@ impl FileReader {
         Ok(())
     }
 
-    // Helper function for `default_projection` to determine how many columns are occupied
-    // by a lance field.
-    fn default_column_count(field: &Field) -> u32 {
-        1 + field
-            .children
-            .iter()
-            .map(Self::default_column_count)
-            .sum::<u32>()
-    }
-
-    // This function is one of the few spots in the reader where we rely on Lance table
-    // format and the fact that we wrote a Lance table schema into the global buffers.
-    //
-    // TODO: In the future it would probably be better for the "default type" of a column
-    // to be something that can be provided dynamically via the encodings registry.  We
-    // could pass the pages of the column to some logic that picks a data type based on the
-    // page encodings.
-
-    /// Loads a default projection for all columns in the file, using the data type that
-    /// was provided when the file was written.
-    fn default_projection(lance_schema: &Schema) -> ReaderProjection {
-        let schema = Arc::new(lance_schema.clone());
-        let mut column_indices = Vec::with_capacity(lance_schema.fields.len());
-        let mut column_index = 0;
-        for field in &lance_schema.fields {
-            column_indices.push(column_index);
-            column_index += Self::default_column_count(field);
-        }
-        ReaderProjection {
-            schema,
-            column_indices,
-        }
-    }
-
     /// Opens a new file reader without any pre-existing knowledge
     ///
     /// This will read the file schema from the file itself and thus requires a bit more I/O
@@ -528,7 +612,8 @@ impl FileReader {
     pub async fn try_open(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
-        decoder_strategy: DecoderMiddlewareChain,
+        decoder_strategy: Arc<DecoderMiddlewareChain>,
+        cache: &FileMetadataCache,
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         Self::try_open_with_file_metadata(
@@ -536,6 +621,7 @@ impl FileReader {
             base_projection,
             decoder_strategy,
             file_metadata,
+            cache,
         )
         .await
     }
@@ -544,20 +630,25 @@ impl FileReader {
     pub async fn try_open_with_file_metadata(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
-        decoder_strategy: DecoderMiddlewareChain,
+        decoder_strategy: Arc<DecoderMiddlewareChain>,
         file_metadata: Arc<CachedFileMetadata>,
+        cache: &FileMetadataCache,
     ) -> Result<Self> {
+        let cache = Arc::new(cache.with_base_path(scheduler.reader().path().clone()));
+
         if let Some(base_projection) = base_projection.as_ref() {
             Self::validate_projection(base_projection, &file_metadata)?;
         }
         let num_rows = file_metadata.num_rows;
         Ok(Self {
             scheduler: Arc::new(LanceEncodingsIo(scheduler)),
-            base_projection: base_projection
-                .unwrap_or(Self::default_projection(file_metadata.file_schema.as_ref())),
+            base_projection: base_projection.unwrap_or(ReaderProjection::from_whole_schema(
+                file_metadata.file_schema.as_ref(),
+            )),
             num_rows,
             metadata: file_metadata,
             decoder_strategy,
+            cache,
         })
     }
 
@@ -581,35 +672,16 @@ impl FileReader {
         Ok(self.metadata.column_infos.to_vec())
     }
 
-    fn check_scheduler_on_drop(
-        stream: BoxStream<'static, ReadBatchTask>,
-        scheduler_handle: tokio::task::JoinHandle<()>,
-    ) -> BoxStream<'static, ReadBatchTask> {
-        // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
-        // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
-        // when the stream finishes.
-        let mut scheduler_handle = Some(scheduler_handle);
-        let check_scheduler = stream::unfold((), move |_| {
-            let handle = scheduler_handle.take();
-            async move {
-                if let Some(handle) = handle {
-                    handle.await.unwrap();
-                }
-                None
-            }
-        });
-        stream.chain(check_scheduler).boxed()
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
-        scheduler: Arc<dyn EncodingsIo>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<FileMetadataCache>,
         num_rows: u64,
-        decoder_strategy: DecoderMiddlewareChain,
+        decoder_strategy: Arc<DecoderMiddlewareChain>,
         range: Range<u64>,
         batch_size: u32,
-        projection: &ReaderProjection,
+        projection: ReaderProjection,
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
@@ -621,74 +693,56 @@ impl FileReader {
             projection.schema.fields.len(),
         );
 
-        if range.is_empty() {
-            return Err(Error::InvalidInput {
-                source: format!("Cannot read empty range {:?} from file", range).into(),
-                location: location!(),
-            });
-        }
+        let config = SchedulerDecoderConfig {
+            batch_size,
+            cache,
+            decoder_strategy,
+            io,
+        };
 
-        let mut decode_scheduler = DecodeBatchScheduler::try_new(
-            &projection.schema,
-            &projection.column_indices,
-            &column_infos,
-            &vec![],
-            num_rows,
-            &decoder_strategy,
-            &scheduler,
-        )?;
+        let requested_rows = RequestedRows::Ranges(vec![range]);
 
-        let root_decoder = decode_scheduler.new_root_decoder_ranges(&[range.clone()]);
-
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        let num_rows_to_read = range.end - range.start;
-
-        let scheduler_handle = tokio::task::spawn(async move {
-            decode_scheduler.schedule_range(range, &filter, tx, scheduler);
-        });
-
-        let batches =
-            BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream();
-
-        Ok(Self::check_scheduler_on_drop(batches, scheduler_handle))
+        Ok(schedule_and_decode(
+            column_infos,
+            requested_rows,
+            filter,
+            projection.column_indices,
+            projection.schema,
+            config,
+        ))
     }
 
     fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
-        projection: &ReaderProjection,
+        projection: ReaderProjection,
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
-        // Grab what we need to initialize the stream
-        let range = range.clone();
-        let projection = projection.clone();
-        let column_infos = self.collect_columns_from_projection(&projection)?;
-        let scheduler = self.scheduler.clone();
-        let num_rows = self.num_rows;
-        let decoder_strategy = self.decoder_strategy.clone();
         // Create and initialize the stream
         Self::do_read_range(
-            column_infos,
-            scheduler,
-            num_rows,
-            decoder_strategy,
+            self.collect_columns_from_projection(&projection)?,
+            self.scheduler.clone(),
+            self.cache.clone(),
+            self.num_rows,
+            self.decoder_strategy.clone(),
             range,
             batch_size,
-            &projection,
+            projection,
             filter,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_take_rows(
         column_infos: Vec<Arc<ColumnInfo>>,
-        scheduler: Arc<dyn EncodingsIo>,
-        num_rows: u64,
-        decoder_strategy: DecoderMiddlewareChain,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<FileMetadataCache>,
+        decoder_strategy: Arc<DecoderMiddlewareChain>,
         indices: Vec<u64>,
         batch_size: u32,
-        projection: &ReaderProjection,
+        projection: ReaderProjection,
+        filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -699,53 +753,41 @@ impl FileReader {
             column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
         );
 
-        let mut decode_scheduler = DecodeBatchScheduler::try_new(
-            &projection.schema,
-            &projection.column_indices,
-            &column_infos,
-            &vec![],
-            num_rows,
-            &decoder_strategy,
-            &scheduler,
-        )?;
+        let config = SchedulerDecoderConfig {
+            batch_size,
+            cache,
+            decoder_strategy,
+            io,
+        };
 
-        let root_decoder = decode_scheduler.new_root_decoder_indices(&indices);
+        let requested_rows = RequestedRows::Indices(indices);
 
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        let num_rows_to_read = indices.len() as u64;
-
-        let scheduler_handle = tokio::task::spawn(async move {
-            decode_scheduler.schedule_take(&indices, &FilterExpression::no_filter(), tx, scheduler)
-        });
-
-        let batches =
-            BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream();
-
-        Ok(Self::check_scheduler_on_drop(batches, scheduler_handle))
+        Ok(schedule_and_decode(
+            column_infos,
+            requested_rows,
+            filter,
+            projection.column_indices,
+            projection.schema,
+            config,
+        ))
     }
 
     fn take_rows(
         &self,
         indices: Vec<u64>,
         batch_size: u32,
-        projection: &ReaderProjection,
+        projection: ReaderProjection,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
-        // Grab what we need to initialize the stream
-        let projection = projection.clone();
-        let column_infos = self.collect_columns_from_projection(&projection)?;
-        let scheduler = self.scheduler.clone();
-        let num_rows = self.num_rows;
-        let decoder_strategy = self.decoder_strategy.clone();
         // Create and initialize the stream
         Self::do_take_rows(
-            column_infos,
-            scheduler,
-            num_rows,
-            decoder_strategy,
+            self.collect_columns_from_projection(&projection)?,
+            self.scheduler.clone(),
+            self.cache.clone(),
+            self.decoder_strategy.clone(),
             indices,
             batch_size,
-            &projection,
+            projection,
+            FilterExpression::no_filter(),
         )
     }
 
@@ -763,10 +805,10 @@ impl FileReader {
         &self,
         params: ReadBatchParams,
         batch_size: u32,
-        projection: &ReaderProjection,
+        projection: ReaderProjection,
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
-        Self::validate_projection(projection, &self.metadata)?;
+        Self::validate_projection(&projection, &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(
@@ -852,15 +894,15 @@ impl FileReader {
         params: ReadBatchParams,
         batch_size: u32,
         batch_readahead: u32,
-        projection: &ReaderProjection,
+        projection: ReaderProjection,
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
         let tasks_stream = self.read_tasks(params, batch_size, projection, filter)?;
         let batch_stream = tasks_stream
             .map(|task| task.task)
             .buffered(batch_readahead as usize)
             .boxed();
-        let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             arrow_schema,
             batch_stream,
@@ -883,7 +925,7 @@ impl FileReader {
             params,
             batch_size,
             batch_readahead,
-            &self.base_projection,
+            self.base_projection.clone(),
             filter,
         )
     }
@@ -946,7 +988,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
     where
         Self: Sized,
     {
-        let projection = FileReader::default_projection(schema);
+        let projection = ReaderProjection::from_whole_schema(schema);
         let footer = FileReader::decode_footer(&bytes)?;
 
         // Next, read the metadata for the columns
@@ -992,7 +1034,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
         let schema_bytes = bytes.slice(schema_start..(schema_start + schema_size));
         let (_, schema) = FileReader::decode_schema(schema_bytes)?;
-        let projection = FileReader::default_projection(&schema);
+        let projection = ReaderProjection::from_whole_schema(&schema);
 
         // Next, read the metadata for the columns
         // This is both the column metadata and the CMO table
@@ -1019,7 +1061,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{pin::Pin, sync::Arc};
+    use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
     use arrow_array::{
         types::{Float64Type, Int32Type},
@@ -1034,7 +1076,6 @@ pub mod tests {
     use lance_encoding::{
         decoder::{decode_batch, DecodeBatchScheduler, DecoderMiddlewareChain, FilterExpression},
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
-        EncodingsIo,
     };
     use lance_io::stream::RecordBatchStream;
     use log::debug;
@@ -1042,11 +1083,11 @@ pub mod tests {
 
     use crate::v2::{
         reader::{EncodedBatchReaderExt, FileReader, ReaderProjection},
-        testing::{write_lance_file, FsFixture},
+        testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
         writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
     };
 
-    async fn create_some_file(fs: &FsFixture) -> (Arc<Schema>, Vec<RecordBatch>) {
+    async fn create_some_file(fs: &FsFixture) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
             Field::new("x", DataType::Float64, true),
             Field::new("y", DataType::Float64, true),
@@ -1120,14 +1161,18 @@ pub mod tests {
     async fn test_round_trip() {
         let fs = FsFixture::default();
 
-        let (_, data) = create_some_file(&fs).await;
+        let WrittenFile { data, .. } = create_some_file(&fs).await;
 
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
-            let file_reader =
-                FileReader::try_open(file_scheduler, None, DecoderMiddlewareChain::default())
-                    .await
-                    .unwrap();
+            let file_reader = FileReader::try_open(
+                file_scheduler,
+                None,
+                Arc::<DecoderMiddlewareChain>::default(),
+                &test_cache(),
+            )
+            .await
+            .unwrap();
 
             let schema = file_reader.schema();
             assert_eq!(schema.metadata.get("foo").unwrap(), "bar");
@@ -1177,7 +1222,7 @@ pub mod tests {
         let decoded = decode_batch(
             &decoded_batch,
             &FilterExpression::no_filter(),
-            &DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
         )
         .await
         .unwrap();
@@ -1191,7 +1236,7 @@ pub mod tests {
         let decoded = decode_batch(
             &decoded_batch,
             &FilterExpression::no_filter(),
-            &DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
         )
         .await
         .unwrap();
@@ -1203,8 +1248,14 @@ pub mod tests {
     async fn test_projection() {
         let fs = FsFixture::default();
 
-        let (schema, data) = create_some_file(&fs).await;
+        let written_file = create_some_file(&fs).await;
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+
+        let field_id_mapping = written_file
+            .field_id_mapping
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>();
 
         for columns in [
             vec!["score"],
@@ -1221,30 +1272,29 @@ pub mod tests {
             let file_reader = FileReader::try_open(
                 file_scheduler.clone(),
                 None,
-                DecoderMiddlewareChain::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
+                &test_cache(),
             )
             .await
             .unwrap();
 
-            let projection = Arc::new(schema.project(&columns).unwrap());
-            let projection = ReaderProjection {
-                column_indices: projection.fields.iter().map(|f| f.id as u32).collect(),
-                schema: projection,
-            };
+            let projected_schema = written_file.schema.project(&columns).unwrap();
+            let projection =
+                ReaderProjection::from_field_ids(&projected_schema, &field_id_mapping).unwrap();
 
             let batch_stream = file_reader
                 .read_stream_projected(
                     lance_io::ReadBatchParams::RangeFull,
                     1024,
                     16,
-                    &projection,
+                    projection.clone(),
                     FilterExpression::no_filter(),
                 )
                 .unwrap();
 
             let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
             verify_expected(
-                &data,
+                &written_file.data,
                 batch_stream,
                 1024,
                 Some(Box::new(move |batch: &RecordBatch| {
@@ -1257,7 +1307,8 @@ pub mod tests {
             let file_reader = FileReader::try_open(
                 file_scheduler.clone(),
                 Some(projection.clone()),
-                DecoderMiddlewareChain::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
+                &test_cache(),
             )
             .await
             .unwrap();
@@ -1273,7 +1324,7 @@ pub mod tests {
 
             let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
             verify_expected(
-                &data,
+                &written_file.data,
                 batch_stream,
                 1024,
                 Some(Box::new(move |batch: &RecordBatch| {
@@ -1291,7 +1342,8 @@ pub mod tests {
         assert!(FileReader::try_open(
             file_scheduler.clone(),
             Some(empty_projection),
-            DecoderMiddlewareChain::default()
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache()
         )
         .await
         .is_err());
@@ -1310,7 +1362,8 @@ pub mod tests {
         assert!(FileReader::try_open(
             file_scheduler.clone(),
             Some(projection_with_dupes),
-            DecoderMiddlewareChain::default()
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache()
         )
         .await
         .is_err());
@@ -1320,19 +1373,20 @@ pub mod tests {
     async fn test_compressing_buffer() {
         let fs = FsFixture::default();
 
-        let (schema, data) = create_some_file(&fs).await;
+        let written_file = create_some_file(&fs).await;
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
 
         // We can specify the projection as part of the read operation via read_stream_projected
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache(),
         )
         .await
         .unwrap();
 
-        let mut projection = schema.project(&["score"]).unwrap();
+        let mut projection = written_file.schema.project(&["score"]).unwrap();
         for field in projection.fields.iter_mut() {
             field
                 .metadata
@@ -1348,14 +1402,14 @@ pub mod tests {
                 lance_io::ReadBatchParams::RangeFull,
                 1024,
                 16,
-                &projection,
+                projection.clone(),
                 FilterExpression::no_filter(),
             )
             .unwrap();
 
         let projection_arrow = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
         verify_expected(
-            &data,
+            &written_file.data,
             batch_stream,
             1024,
             Some(Box::new(move |batch: &RecordBatch| {
@@ -1368,14 +1422,15 @@ pub mod tests {
     #[tokio::test]
     async fn test_read_all() {
         let fs = FsFixture::default();
-        let (_, data) = create_some_file(&fs).await;
+        let WrittenFile { data, .. } = create_some_file(&fs).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache(),
         )
         .await
         .unwrap();
@@ -1398,14 +1453,15 @@ pub mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drop_in_progress() {
         let fs = FsFixture::default();
-        let (_, data) = create_some_file(&fs).await;
+        let WrittenFile { data, .. } = create_some_file(&fs).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache(),
         )
         .await
         .unwrap();
@@ -1440,19 +1496,24 @@ pub mod tests {
         // if the stream was dropped before it finished.
 
         let fs = FsFixture::default();
-        let (schema, data) = create_some_file(&fs).await;
-        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        let written_file = create_some_file(&fs).await;
+        let total_rows = written_file
+            .data
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
 
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache(),
         )
         .await
         .unwrap();
 
-        let projection = FileReader::default_projection(&schema);
+        let projection = ReaderProjection::from_whole_schema(&written_file.schema);
         let column_infos = file_reader
             .collect_columns_from_projection(&projection)
             .unwrap();
@@ -1462,9 +1523,12 @@ pub mod tests {
             &column_infos,
             &vec![],
             total_rows as u64,
-            &DecoderMiddlewareChain::default(),
-            &(file_reader.scheduler.clone() as Arc<dyn EncodingsIo>),
+            Arc::<DecoderMiddlewareChain>::default(),
+            file_reader.scheduler.clone(),
+            test_cache(),
+            &FilterExpression::no_filter(),
         )
+        .await
         .unwrap();
 
         let range = 0..total_rows as u64;
@@ -1517,7 +1581,8 @@ pub mod tests {
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &test_cache(),
         )
         .await
         .unwrap();

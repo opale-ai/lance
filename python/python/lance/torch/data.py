@@ -26,6 +26,7 @@ from ..sampler import (
     ShardedFragmentSampler,
     maybe_sample,
 )
+from .dist import get_global_rank, get_global_world_size
 
 __all__ = ["LanceDataset"]
 
@@ -43,10 +44,13 @@ def _to_tensor(
         arr: pa.Array = batch[col]
 
         tensor: torch.Tensor = None
-        if (
-            pa.types.is_fixed_size_list(arr.type)
-            or isinstance(arr.type, pa.FixedShapeTensorType)
-        ) and (
+        if (isinstance(arr.type, pa.FixedShapeTensorType)) and (
+            pa.types.is_floating(arr.type.value_type)
+            or pa.types.is_integer(arr.type.value_type)
+        ):
+            arr = arr.storage
+
+        if (pa.types.is_fixed_size_list(arr.type)) and (
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
@@ -229,9 +233,6 @@ class LanceDataset(torch.utils.data.IterableDataset):
             warnings.warn("rank and world_size are deprecated", DeprecationWarning)
         self.sampler: Optional[Sampler] = sampler
 
-        if filter is not None and self.samples > 0 or self.samples is None:
-            raise ValueError("`filter` is not supported with `samples`")
-
         # Dataset with huggingface metadata
         if (
             dataset.schema.metadata is not None
@@ -254,13 +255,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 rank = self.rank
                 world_size = self.world_size
             else:
-                worker_info = torch.utils.data.get_worker_info()
-                if worker_info is not None:
-                    rank = worker_info.id
-                    world_size = worker_info.num_workers
-                else:
-                    rank = None
-                    world_size = None
+                rank = get_global_rank()
+                world_size = get_global_world_size()
             if self.shard_granularity is None:
                 if rank is not None and world_size is not None:
                     sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
@@ -285,6 +281,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     n=self.samples,
                     columns=self.columns,
                     batch_size=self.batch_size,
+                    filt=self.filter,
                 )
             else:
                 raw_stream = sampler(

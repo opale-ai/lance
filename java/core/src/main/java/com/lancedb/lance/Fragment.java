@@ -14,6 +14,7 @@
 
 package com.lancedb.lance;
 
+import java.util.Map;
 import java.util.Optional;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -29,7 +30,16 @@ public class Fragment {
     JniLoader.ensureLoaded();
   }
 
-  /** Create a fragment from the given data in vector schema root. */
+  /**
+   * Create a fragment from the given data.
+   *
+   * @param datasetUri the dataset uri
+   * @param allocator the buffer allocator
+   * @param root the vector schema root
+   * @param fragmentId the fragment id
+   * @param params the write params
+   * @return the fragment metadata
+   */
   public static FragmentMetadata create(String datasetUri, BufferAllocator allocator,
       VectorSchemaRoot root, Optional<Integer> fragmentId, WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
@@ -42,11 +52,19 @@ public class Fragment {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
       return FragmentMetadata.fromJson(createWithFfiArray(datasetUri, arrowArray.memoryAddress(),
           arrowSchema.memoryAddress(), fragmentId, params.getMaxRowsPerFile(),
-          params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode()));
+          params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode(),
+          params.getStorageOptions()));
     }
   }
 
-  /** Create a fragment from the given data. */
+  /**
+   * Create a fragment from the given arrow stream.
+   * @param datasetUri  the dataset uri
+   * @param stream  the arrow stream
+   * @param fragmentId  the fragment id
+   * @param params  the write params
+   * @return  the fragment metadata
+   */
   public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
       Optional<Integer> fragmentId, WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
@@ -56,7 +74,7 @@ public class Fragment {
     return FragmentMetadata.fromJson(createWithFfiStream(datasetUri,
         stream.memoryAddress(), fragmentId,
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
-        params.getMaxBytesPerFile(), params.getMode()));
+        params.getMaxBytesPerFile(), params.getMode(), params.getStorageOptions()));
   }
 
   /**
@@ -67,7 +85,7 @@ public class Fragment {
   private static native String createWithFfiArray(String datasetUri,
       long arrowArrayMemoryAddress, long arrowSchemaMemoryAddress, Optional<Integer> fragmentId,
       Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode);
+      Optional<Long> maxBytesPerFile, Optional<String> mode, Map<String, String> storageOptions);
 
   /**
    * Create a fragment from the given arrow stream.
@@ -77,5 +95,5 @@ public class Fragment {
   private static native String createWithFfiStream(String datasetUri, long arrowStreamMemoryAddress,
       Optional<Integer> fragmentId, Optional<Integer> maxRowsPerFile,
       Optional<Integer> maxRowsPerGroup, Optional<Long> maxBytesPerFile,
-      Optional<String> mode);
+      Optional<String> mode, Map<String, String> storageOptions);
 }

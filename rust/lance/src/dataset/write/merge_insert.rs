@@ -86,7 +86,7 @@ use crate::{
     Dataset,
 };
 
-use super::write_fragments_internal;
+use super::{write_fragments_internal, WriteParams};
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -452,7 +452,7 @@ impl MergeInsertJob {
             self.dataset.clone(),
             index_mapper,
             Arc::new(self.dataset.schema().project_by_schema(schema.as_ref())?),
-            num_cpus::get(),
+            get_num_compute_intensive_cpus(),
         )?) as Arc<dyn ExecutionPlan>;
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
@@ -701,6 +701,7 @@ impl MergeInsertJob {
                         .updater(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
+                            None,
                         )
                         .await?;
 
@@ -891,12 +892,12 @@ impl MergeInsertJob {
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
             let new_fragments = write_fragments_internal(
-                None,
+                Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema(),
                 Box::pin(stream),
-                Default::default(),
+                WriteParams::default(),
             )
             .await?;
             // Apply deletions
@@ -957,7 +958,7 @@ impl MergeInsertJob {
                     }
                 }
             })
-            .buffer_unordered(num_cpus::get() * 4);
+            .buffer_unordered(dataset.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -991,6 +992,7 @@ impl MergeInsertJob {
             &transaction,
             &Default::default(),
             &Default::default(),
+            dataset.manifest_naming_scheme,
         )
         .await?;
 
@@ -1362,8 +1364,16 @@ mod tests {
         assert_eq!(merge_stats.num_deleted_rows, stats[2]);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_basic_merge() {
+    async fn test_basic_merge(
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1
+        )]
+        version: LanceFileVersion,
+    ) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -1384,7 +1394,15 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(Dataset::write(batches, test_uri, None).await.unwrap());
+        let ds = Arc::new(
+            Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams::with_storage_version(version)),
+            )
+            .await
+            .unwrap(),
+        );
 
         let new_batch = RecordBatch::try_new(
             schema.clone(),
@@ -1895,7 +1913,7 @@ mod tests {
                 // Updated columns should be only columns in new data files
                 // -2 field ids are tombstoned.
                 assert_eq!(&data_files[0].fields, &[0, -2, -2]);
-                assert_eq!(&data_files[1].fields, &[1, 2]);
+                assert_eq!(&data_files[1].fields, &[2, 1]);
             };
             has_added_files(&fragments_after[1]);
             has_added_files(&fragments_after[2]);

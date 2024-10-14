@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import pickle
 import random
 import sqlite3
+import time
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -24,6 +26,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Set,
     TypedDict,
     Union,
 )
@@ -46,6 +49,8 @@ from .lance import (
     _Dataset,
     _MergeInsertBuilder,
     _Operation,
+    _RewriteGroup,
+    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
@@ -215,9 +220,7 @@ class LanceDataset(pa.dataset.Dataset):
         return Tags(self._ds)
 
     def list_indices(self) -> List[Dict[str, Any]]:
-        if getattr(self, "_list_indices_res", None) is None:
-            self._list_indices_res = self._ds.load_indices()
-        return self._list_indices_res
+        return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -251,6 +254,8 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         fast_search: bool = False,
         io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        use_scalar_index: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -306,6 +311,27 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        use_scalar_index: bool, default True
+            Lance will automatically use scalar indices to optimize a query.  In some
+            corner cases this can make query performance worse and this parameter can
+            be used to disable scalar indices in these cases.
+        late_materialization: bool or List[str], default None
+            Allows custom control over late materialization.  Late materialization
+            fetches non-query columns using a take operation after the filter.  This
+            is useful when there are few results or columns are very large.
+
+            Early materialization can be better when there are many results or the
+            columns are very narrow.
+
+            If True, then all columns are late materialized.
+            If False, then all columns are early materialized.
+            If a list of strings, then only the columns in the list are
+              late materialized.
+
+            The default uses a heuristic that assumes filters will select about 0.1%
+            of the rows.  If your filter is more selective (e.g. find by id) you may
+            want to set this to True.  If your filter is not very selective (e.g.
+            matches 20% of the rows) you may want to set this to False.
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents containing "hello" or "world".
@@ -353,9 +379,11 @@ class LanceDataset(pa.dataset.Dataset):
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
+            .late_materialization(late_materialization)
             .with_row_id(with_row_id)
             .with_row_address(with_row_address)
             .use_stats(use_stats)
+            .use_scalar_index(use_scalar_index)
             .fast_search(fast_search)
         )
         if full_text_query is not None:
@@ -407,6 +435,8 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search: bool = False,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        use_scalar_index: Optional[bool] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -453,6 +483,12 @@ class LanceDataset(pa.dataset.Dataset):
             and memory use might increase.
         prefilter: bool, default False
             Run filter before the vector search.
+        late_materialization: bool or List[str], default None
+            Allows custom control over late materialization.  See
+            ``ScannerBuilder.late_materialization`` for more information.
+        use_scalar_index: bool, default True
+            Allows custom control over scalar index usage.  See
+            ``ScannerBuilder.use_scalar_index`` for more information.
         with_row_id: bool, default False
             Return row ID.
         with_row_address: bool, default False
@@ -485,6 +521,8 @@ class LanceDataset(pa.dataset.Dataset):
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
+            late_materialization=late_materialization,
+            use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -544,6 +582,8 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        use_scalar_index: Optional[bool] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -567,6 +607,8 @@ class LanceDataset(pa.dataset.Dataset):
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
+            late_materialization=late_materialization,
+            use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1059,7 +1101,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
-    ):
+    ) -> Dict[str, Any]:
         """
         Update column values for rows matching where.
 
@@ -1070,13 +1112,19 @@ class LanceDataset(pa.dataset.Dataset):
         where : str, optional
             A SQL predicate indicating which rows should be updated.
 
+        Returns
+        -------
+        updates : dict
+            A dictionary containing the number of rows updated.
+
         Examples
         --------
         >>> import lance
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
-        >>> dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> update_stats = dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> update_stats["num_updated_rows"] = 2
         >>> dataset.to_table().to_pandas()
            a  b
         0  1  a
@@ -1085,7 +1133,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        self._ds.update(updates, where)
+        return self._ds.update(updates, where)
 
     def versions(self):
         """
@@ -1208,6 +1256,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        **kwargs,
     ):
         """Create a scalar index on a column.
 
@@ -1279,6 +1328,15 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+
+        Optional Parameters
+        -------------------
+        with_position: bool, default True
+            This is for the ``INVERTED`` index. If True, the index will store the
+            positions of the words in the document, so that you can conduct phrase
+            query. This will significantly increase the index size.
+            It won't impact the performance of non-phrase queries even if it is set to
+            True.
 
         Examples
         --------
@@ -1364,7 +1422,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} cannot currently be a duration"
             )
 
-        self._ds.create_index([column], index_type, name, replace)
+        self._ds.create_index([column], index_type, name, replace, None, kwargs)
 
     def create_index(
         self,
@@ -1387,8 +1445,10 @@ class LanceDataset(pa.dataset.Dataset):
         shuffle_partition_concurrency: Optional[int] = None,
         # experimental parameters
         ivf_centroids_file: Optional[str] = None,
-        precomputed_partiton_dataset: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
+        one_pass_ivfpq: bool = False,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1445,6 +1505,12 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        filter_nan: bool
+            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
+            values are present (and otherwise will not). Disables the null filter used
+            for nullable columns. Obtains a small speed boost.
+        one_pass_ivfpq: bool
+            Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1568,6 +1634,58 @@ class LanceDataset(pa.dataset.Dataset):
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
+        if index_type != "IVF_PQ" and one_pass_ivfpq:
+            raise ValueError(
+                f'one_pass_ivfpq requires index_type="IVF_PQ", got {index_type}'
+            )
+
+        # Handle timing for various parts of accelerated builds
+        timers = {}
+        if one_pass_ivfpq and accelerator is not None:
+            from .vector import (
+                one_pass_assign_ivf_pq_on_accelerator,
+                one_pass_train_ivf_pq_on_accelerator,
+            )
+
+            logging.info("Doing one-pass ivfpq accelerated computations")
+
+            timers["ivf+pq_train:start"] = time.time()
+            ivf_centroids, ivf_kmeans, pq_codebook, pq_kmeans_list = (
+                one_pass_train_ivf_pq_on_accelerator(
+                    self,
+                    column[0],
+                    num_partitions,
+                    metric,
+                    accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                    batch_size=20480,
+                    filter_nan=filter_nan,
+                )
+            )
+            timers["ivf+pq_train:end"] = time.time()
+            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+            logging.info("ivf+pq training time: %ss", ivfpq_train_time)
+            timers["ivf+pq_assign:start"] = time.time()
+            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                metric,
+                accelerator,
+                ivf_kmeans,
+                pq_kmeans_list,
+                batch_size=20480,
+                filter_nan=filter_nan,
+            )
+            timers["ivf+pq_assign:end"] = time.time()
+            ivfpq_assign_time = (
+                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+            )
+            logging.info("ivf+pq transform time: %ss", ivfpq_assign_time)
+
+            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                shuffle_output_dir, "data"
+            )
         if index_type.startswith("IVF"):
             if (ivf_centroids is not None) and (ivf_centroids_file is not None):
                 raise ValueError(
@@ -1596,43 +1714,72 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_partitions"] = num_partitions
 
-            if (precomputed_partiton_dataset is not None) and (ivf_centroids is None):
+            if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
                     "ivf_centroids must be provided when"
-                    " precomputed_partiton_dataset is provided"
+                    " precomputed_partition_dataset is provided"
                 )
-            if precomputed_partiton_dataset is not None:
+            if precomputed_partition_dataset is not None:
+                logging.info("Using provided precomputed partition dataset")
                 precomputed_ds = LanceDataset(
-                    precomputed_partiton_dataset, storage_options=storage_options
+                    precomputed_partition_dataset, storage_options=storage_options
                 )
-                if len(precomputed_ds.get_fragments()) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one fragment"
-                    )
-                files = precomputed_ds.get_fragments()[0].data_files()
-                if len(files) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one files"
-                    )
-                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
+                if not (
+                    "PQ" in index_type
+                    and pq_codebook is None
+                    and accelerator is not None
+                    and "precomputed_partitions_file" in kwargs
+                ):
+                    # In this case, the precomputed partitions file would be used
+                    # without being turned into a set of precomputed buffers, so it
+                    # needs to have a very specific format
+                    if len(precomputed_ds.get_fragments()) != 1:
+                        raise ValueError(
+                            "precomputed_partition_dataset must have only one fragment"
+                        )
+                    files = precomputed_ds.get_fragments()[0].data_files()
+                    if len(files) != 1:
+                        raise ValueError(
+                            "precomputed_partition_dataset must have only one files"
+                        )
+                kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
-            if accelerator is not None and ivf_centroids is None:
+            if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
+                logging.info("Computing new precomputed partition dataset")
                 # Use accelerator to train ivf centroids
                 from .vector import (
                     compute_partitions,
                     train_ivf_centroids_on_accelerator,
                 )
 
+                timers["ivf_train:start"] = time.time()
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
                     num_partitions,
                     metric,
                     accelerator,
+                    filter_nan=filter_nan,
                 )
+                timers["ivf_train:end"] = time.time()
+                ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
+                logging.info("ivf training time: %ss", ivf_train_time)
+                timers["ivf_assign:start"] = time.time()
+                num_sub_vectors_cur = None
+                if "PQ" in index_type and pq_codebook is None:
+                    # compute residual subspace columns in the same pass
+                    num_sub_vectors_cur = num_sub_vectors
                 partitions_file = compute_partitions(
-                    self, column[0], kmeans, batch_size=20480
+                    self,
+                    column[0],
+                    kmeans,
+                    batch_size=20480,
+                    num_sub_vectors=num_sub_vectors_cur,
+                    filter_nan=filter_nan,
                 )
+                timers["ivf_assign:end"] = time.time()
+                ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
+                logging.info("ivf transform time: %ss", ivf_assign_time)
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -1674,6 +1821,57 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
 
+            if (
+                pq_codebook is None
+                and accelerator is not None
+                and "precomputed_partitions_file" in kwargs
+                and not one_pass_ivfpq
+            ):
+                logging.info("Computing new precomputed shuffle buffers for PQ.")
+                partitions_file = kwargs["precomputed_partitions_file"]
+                del kwargs["precomputed_partitions_file"]
+
+                partitions_ds = LanceDataset(partitions_file)
+                # Use accelerator to train pq codebook
+                from .vector import (
+                    compute_pq_codes,
+                    train_pq_codebook_on_accelerator,
+                )
+
+                timers["pq_train:start"] = time.time()
+                pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
+                    partitions_ds,
+                    metric,
+                    accelerator=accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                )
+                timers["pq_train:end"] = time.time()
+                pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
+                logging.info("pq training time: %ss", pq_train_time)
+                timers["pq_assign:start"] = time.time()
+                shuffle_output_dir, shuffle_buffers = compute_pq_codes(
+                    partitions_ds,
+                    kmeans_list,
+                    batch_size=20480,
+                )
+                timers["pq_assign:end"] = time.time()
+                pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
+                logging.info("pq transform time: %ss", pq_assign_time)
+                # Save disk space
+                if precomputed_partition_dataset is not None and os.path.exists(
+                    partitions_file
+                ):
+                    logging.info(
+                        "Temporary partitions file stored at %s,"
+                        "you may want to delete it.",
+                        partitions_file,
+                    )
+
+                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                    shuffle_output_dir, "data"
+                )
+
             if pq_codebook is not None:
                 # User provided IVF centroids
                 if _check_for_numpy(pq_codebook) and isinstance(
@@ -1707,9 +1905,23 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
+        timers["final_create_index:start"] = time.time()
         self._ds.create_index(
             column, index_type, name, replace, storage_options, kwargs
         )
+        timers["final_create_index:end"] = time.time()
+        final_create_index_time = (
+            timers["final_create_index:end"] - timers["final_create_index:start"]
+        )
+        logging.info("Final create_index rust time: %ss", final_create_index_time)
+        # Save disk space
+        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_shuffle_buffers_path"]
+        ):
+            logging.info(
+                "Temporary shuffle buffers stored at %s, you may want to delete it.",
+                kwargs["precomputed_shuffle_buffers_path"],
+            )
         return self
 
     def session(self) -> Session:
@@ -1739,6 +1951,7 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        enable_v2_manifest_paths: Optional[bool] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -1776,6 +1989,14 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        enable_v2_manifest_paths : bool, optional
+            If True, and this is a new dataset, uses the new V2 manifest paths.
+            These paths provide more efficient opening of datasets with many
+            versions on object stores. This parameter has no effect if the dataset
+            already exists. To migrate an existing dataset, instead use the
+            :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
+            turning this on will make the dataset unreadable for older versions
+            of Lance (prior to 0.17.0).
 
         Returns
         -------
@@ -1819,6 +2040,7 @@ class LanceDataset(pa.dataset.Dataset):
             read_version,
             commit_lock,
             storage_options=storage_options,
+            enable_v2_manifest_paths=enable_v2_manifest_paths,
         )
         return LanceDataset(base_uri, storage_options=storage_options)
 
@@ -1830,6 +2052,20 @@ class LanceDataset(pa.dataset.Dataset):
         the dataset is corrupted.
         """
         self._ds.validate()
+
+    def migrate_manifest_paths_v2(self):
+        """
+        Migrate the manifest paths to the new format.
+
+        This will update the manifest to use the new v2 format for paths.
+
+        This function is idempotent, and can be run multiple times without
+        changing the state of the object store.
+
+        DANGER: this should not be run while other concurrent operations are happening.
+        And it should also run until completion before resuming other operations.
+        """
+        self._ds.migrate_manifest_paths_v2()
 
     @property
     def optimize(self) -> "DatasetOptimizer":
@@ -2134,6 +2370,84 @@ class LanceOperation:
         def _to_inner(self):
             return _Operation.restore(self.version)
 
+    @dataclass
+    class RewriteGroup:
+        """
+        Collection of rewritten files
+        """
+
+        old_fragments: Iterable[FragmentMetadata]
+        new_fragments: Iterable[FragmentMetadata]
+
+        def _to_inner(self):
+            old_fragments = [f._metadata for f in self.old_fragments]
+            new_fragments = [f._metadata for f in self.new_fragments]
+            return _RewriteGroup(old_fragments, new_fragments)
+
+    @dataclass
+    class RewrittenIndex:
+        """
+        An index that has been rewritten
+        """
+
+        old_id: str
+        new_id: str
+
+        def _to_inner(self):
+            return _RewrittenIndex(self.old_id, self.new_id)
+
+    @dataclass
+    class Rewrite(BaseOperation):
+        """
+        Operation that rewrites one or more files and indices into one
+        or more files and indices.
+
+        Attributes
+        ----------
+        groups: list[RewriteGroup]
+            Groups of files that have been rewritten.
+        rewritten_indices: list[RewrittenIndex]
+            Indices that have been rewritten.
+
+        Warning
+        -------
+        This is an advanced API not intended for general use.
+        """
+
+        groups: Iterable[LanceOperation.RewriteGroup]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+
+        def __post_init__(self):
+            all_frags = [old for group in self.groups for old in group.old_fragments]
+            all_frags += [new for group in self.groups for new in group.new_fragments]
+            LanceOperation._validate_fragments(all_frags)
+
+        def _to_inner(self):
+            groups = [group._to_inner() for group in self.groups]
+            rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
+            return _Operation.rewrite(groups, rewritten_indices)
+
+    @dataclass
+    class CreateIndex(BaseOperation):
+        """
+        Operation that creates an index on the dataset.
+        """
+
+        uuid: str
+        name: str
+        fields: List[int]
+        dataset_version: int
+        fragment_ids: Set[int]
+
+        def _to_inner(self):
+            return _Operation.create_index(
+                self.uuid,
+                self.name,
+                self.fields,
+                self.dataset_version,
+                self.fragment_ids,
+            )
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
@@ -2142,6 +2456,7 @@ class ScannerBuilder:
         self._filter = None
         self._substrait_filter = None
         self._prefilter = None
+        self._late_materialization = None
         self._offset = None
         self._columns = None
         self._columns_with_transform = None
@@ -2157,6 +2472,7 @@ class ScannerBuilder:
         self._use_stats = True
         self._fast_search = None
         self._full_text_query = None
+        self._use_scalar_index = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2304,6 +2620,12 @@ class ScannerBuilder:
         self._with_row_address = with_row_address
         return self
 
+    def late_materialization(
+        self, late_materialization: bool | List[str]
+    ) -> ScannerBuilder:
+        self._late_materialization = late_materialization
+        return self
+
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
         """
         Enable use of statistics for query planning.
@@ -2312,6 +2634,17 @@ class ScannerBuilder:
         This should be left on for normal use.
         """
         self._use_stats = use_stats
+        return self
+
+    def use_scalar_index(self, use_scalar_index: bool = True) -> ScannerBuilder:
+        """
+        Set whether scalar indices should be used in a query
+
+        Scans will use scalar indices, when available, to optimize queries with filters.
+        However, in some corner cases, scalar indices may make performance worse.  This
+        parameter allows users to disable scalar indices in these cases.
+        """
+        self._use_scalar_index = use_scalar_index
         return self
 
     def with_fragments(
@@ -2428,6 +2761,8 @@ class ScannerBuilder:
             self._substrait_filter,
             self._fast_search,
             self._full_text_query,
+            self._late_materialization,
+            self._use_scalar_index,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -2635,6 +2970,15 @@ class DatasetOptimizer:
         the new data to existing partitions.  This means an update is much quicker
         than retraining the entire index but may have less accuracy (especially
         if the new data exhibits new patterns, concepts, or trends)
+
+        Parameters
+        ----------
+        num_indices_to_merge: int, default 1
+            The number of indices to merge.
+            If set to 0, new delta index will be created.
+        index_names: List[str], default None
+            The names of the indices to optimize.
+            If None, all indices will be optimized.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
@@ -2683,6 +3027,19 @@ class Tags:
 
         """
         self._ds.delete_tag(tag)
+
+    def update(self, tag: str, version: int) -> None:
+        """
+        Update tag to a new version.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to update.
+        version: int,
+            The new dataset version to tag.
+        """
+        self._ds.update_tag(tag, version)
 
 
 class DatasetStats(TypedDict):
@@ -2734,8 +3091,9 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: str = "legacy",
+    data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
+    enable_v2_manifest_paths: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2775,14 +3133,19 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default (None)
+        will use the latest stable version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
+    enable_v2_manifest_paths : bool, optional
+        If True, and this is a new dataset, uses the new V2 manifest paths.
+        These paths provide more efficient opening of datasets with many
+        versions on object stores. This parameter has no effect if the dataset
+        already exists. To migrate an existing dataset, instead use the
+        :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -2815,6 +3178,7 @@ def write_dataset(
         "progress": progress,
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
+        "enable_v2_manifest_paths": enable_v2_manifest_paths,
     }
 
     if commit_lock:

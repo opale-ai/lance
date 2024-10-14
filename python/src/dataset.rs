@@ -28,7 +28,10 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::transaction::validate_operation;
+use lance::dataset::scanner::MaterializationStyle;
+use lance::dataset::transaction::{
+    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex,
+};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -41,6 +44,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
@@ -53,6 +57,7 @@ use lance_index::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
+use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -65,6 +70,7 @@ use pyo3::{
     PyObject, PyResult,
 };
 use snafu::{location, Location};
+use uuid::Uuid;
 
 use crate::error::PythonErrorExt;
 use crate::fragment::{FileFragment, FragmentMetadata};
@@ -215,6 +221,41 @@ impl MergeInsertBuilder {
     }
 }
 
+#[pyclass(name = "_RewriteGroup", module = "_lib")]
+#[derive(Clone)]
+pub struct RewriteGroup(LanceRewriteGroup);
+
+#[pymethods]
+impl RewriteGroup {
+    #[new]
+    pub fn new(old_fragments: Vec<FragmentMetadata>, new_fragments: Vec<FragmentMetadata>) -> Self {
+        let old_fragments = into_fragments(old_fragments);
+        let new_fragments = into_fragments(new_fragments);
+        Self(LanceRewriteGroup {
+            old_fragments,
+            new_fragments,
+        })
+    }
+}
+
+#[pyclass(name = "_RewrittenIndex", module = "_lib")]
+#[derive(Clone)]
+pub struct RewrittenIndex(LanceRewrittenIndex);
+
+#[pymethods]
+impl RewrittenIndex {
+    #[new]
+    pub fn new(old_index: String, new_index: String) -> PyResult<Self> {
+        let old_id: Uuid = old_index
+            .parse()
+            .map_err(|e: uuid::Error| PyValueError::new_err(e.to_string()))?;
+        let new_id: Uuid = new_index
+            .parse()
+            .map_err(|e: uuid::Error| PyValueError::new_err(e.to_string()))?;
+        Ok(Self(LanceRewrittenIndex { old_id, new_id }))
+    }
+}
+
 #[pymethods]
 impl Operation {
     fn __repr__(&self) -> String {
@@ -228,7 +269,11 @@ impl Operation {
     ) -> PyResult<Self> {
         let schema = convert_schema(&schema.0)?;
         let fragments = into_fragments(fragments);
-        let op = LanceOperation::Overwrite { fragments, schema };
+        let op = LanceOperation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values: None,
+        };
         Ok(Self(op))
     }
 
@@ -265,6 +310,46 @@ impl Operation {
     #[staticmethod]
     fn restore(version: u64) -> PyResult<Self> {
         let op = LanceOperation::Restore { version };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn rewrite(
+        groups: Vec<RewriteGroup>,
+        rewritten_indices: Vec<RewrittenIndex>,
+    ) -> PyResult<Self> {
+        let groups = groups.into_iter().map(|g| g.0).collect();
+        let rewritten_indices = rewritten_indices.into_iter().map(|r| r.0).collect();
+        let op = LanceOperation::Rewrite {
+            groups,
+            rewritten_indices,
+        };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn create_index(
+        uuid: String,
+        name: String,
+        fields: Vec<i32>,
+        dataset_version: u64,
+        fragment_ids: &PySet,
+    ) -> PyResult<Self> {
+        let fragment_ids: Vec<u32> = fragment_ids
+            .iter()
+            .map(|item| item.extract::<u32>())
+            .collect::<PyResult<Vec<u32>>>()?;
+        let new_indices = vec![Index {
+            uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
+            name,
+            fields,
+            dataset_version,
+            fragment_bitmap: Some(fragment_ids.into_iter().collect()),
+        }];
+        let op = LanceOperation::CreateIndex {
+            new_indices,
+            removed_indices: vec![],
+        };
         Ok(Self(op))
     }
 }
@@ -464,6 +549,8 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
         full_text_query: Option<&PyDict>,
+        late_materialization: Option<PyObject>,
+        use_scalar_index: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -572,6 +659,29 @@ impl Dataset {
                 })
                 .collect();
             scanner.with_fragments(fragments);
+        }
+
+        if let Some(late_materialization) = late_materialization {
+            if let Ok(style_as_bool) = late_materialization.extract::<bool>(self_.py()) {
+                if style_as_bool {
+                    scanner.materialization_style(MaterializationStyle::AllLate);
+                } else {
+                    scanner.materialization_style(MaterializationStyle::AllEarly);
+                }
+            } else if let Ok(columns) = late_materialization.extract::<Vec<String>>(self_.py()) {
+                scanner.materialization_style(
+                    MaterializationStyle::all_early_except(&columns, self_.ds.schema())
+                        .infer_error()?,
+                );
+            } else {
+                return Err(PyValueError::new_err(
+                    "late_materialization must be a bool or a list of strings",
+                ));
+            }
+        }
+
+        if let Some(use_scalar_index) = use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
         }
 
         if let Some(nearest) = nearest {
@@ -863,7 +973,7 @@ impl Dataset {
         Ok(())
     }
 
-    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<()> {
+    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<PyObject> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
             builder = builder
@@ -888,9 +998,11 @@ impl Dataset {
             .block_on(None, operation.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        self.ds = new_self;
-
-        Ok(())
+        self.ds = new_self.new_dataset;
+        let update_dict = PyDict::new(updates.py());
+        let num_rows_updated = new_self.rows_updated;
+        update_dict.set_item("num_rows_updated", num_rows_updated)?;
+        Ok(update_dict.into())
     }
 
     fn count_deleted_rows(&self) -> PyResult<usize> {
@@ -1023,6 +1135,14 @@ impl Dataset {
         Ok(())
     }
 
+    fn update_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.tags.update(tag.as_str(), version))?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[pyo3(signature = (**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
@@ -1030,6 +1150,13 @@ impl Dataset {
         if let Some(kwargs) = kwargs {
             if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
                 options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+            if let Some(index_names) = kwargs.get_item("index_names")? {
+                options.index_names = Some(
+                    index_names
+                        .extract::<Vec<String>>()
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                );
             }
         }
         RT.block_on(
@@ -1067,27 +1194,33 @@ impl Dataset {
         };
 
         log::info!("Creating index: type={}", index_type);
-        let params: Box<dyn IndexParams> = if index_type == "BTREE" {
-            Box::<ScalarIndexParams>::default()
-        } else if index_type == "BITMAP" {
-            Box::new(ScalarIndexParams {
+        let params: Box<dyn IndexParams> = match index_type.as_str() {
+            "BTREE" => Box::<ScalarIndexParams>::default(),
+            "BITMAP" => Box::new(ScalarIndexParams {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
-            })
-        } else if index_type == "LABEL_LIST" {
-            Box::new(ScalarIndexParams {
+            }),
+            "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
-            })
-        } else if index_type == "INVERTED" {
-            Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::Inverted),
-            })
-        } else {
-            let column_type = match self.ds.schema().field(columns[0]) {
-                Some(f) => f.data_type().clone(),
-                None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
-            };
-            prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
+            }),
+            "INVERTED" => {
+                let mut params = InvertedIndexParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(with_position) = kwargs.get_item("with_position")? {
+                        params.with_position = with_position.extract()?;
+                    }
+                }
+                Box::new(params)
+            }
+            _ => {
+                let column_type = match self.ds.schema().field(columns[0]) {
+                    Some(f) => f.data_type().clone(),
+                    None => {
+                        return Err(PyValueError::new_err("Column not found in dataset schema."))
+                    }
+                };
+                prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
+            }
         };
 
         let replace = replace.unwrap_or(true);
@@ -1151,6 +1284,7 @@ impl Dataset {
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1188,6 +1322,7 @@ impl Dataset {
                     object_store_params,
                     commit_handler,
                     object_store_registry,
+                    enable_v2_manifest_paths.unwrap_or(false),
                 )
                 .await
             })?
@@ -1201,6 +1336,14 @@ impl Dataset {
     fn validate(&self) -> PyResult<()> {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    fn migrate_manifest_paths_v2(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.migrate_manifest_paths_v2())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
@@ -1395,6 +1538,12 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
                 storage_options: Some(storage_options),
                 ..Default::default()
             });
+        }
+
+        if let Some(enable_v2_manifest_paths) =
+            get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
+        {
+            p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
         p.commit_handler = get_commit_handler(options);

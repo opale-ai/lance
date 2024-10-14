@@ -114,9 +114,9 @@ class LanceFragment(pa.dataset.Fragment):
     @staticmethod
     def create_from_file(
         filename: Union[str, Path],
-        schema: pa.Schema,
+        dataset: LanceDataset,
         fragment_id: int,
-    ) -> LanceFragment:
+    ) -> FragmentMetadata:
         """Create a fragment from the given datafile uri.
 
         This can be used if the datafile is loss from dataset.
@@ -129,12 +129,13 @@ class LanceFragment(pa.dataset.Fragment):
         ----------
         filename: str
             The filename of the datafile.
-        scheme: pa.Schema
-            The schema for the new datafile.
+        dataset: LanceDataset
+            The dataset that the fragment belongs to.
         fragment_id: int
             The ID of the fragment.
         """
-        return _Fragment.create_from_file(filename, schema, fragment_id)
+        fragment = _Fragment.create_from_file(filename, dataset._ds, fragment_id)
+        return FragmentMetadata(fragment.json())
 
     @staticmethod
     def create(
@@ -146,7 +147,7 @@ class LanceFragment(pa.dataset.Fragment):
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
-        data_storage_version: str = "legacy",
+        data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
@@ -179,11 +180,10 @@ class LanceFragment(pa.dataset.Fragment):
             The write mode. If "append" is specified, the data will be checked
             against the existing dataset's schema. Otherwise, pass "create" or
             "overwrite" to assign new field ids to the schema.
-        data_storage_version: optional, str, default "legacy"
+        data_storage_version: optional, str, default None
             The version of the data storage format to use. Newer versions are more
-            efficient but require newer versions of lance to read.  The default is
-            "legacy" which will use the legacy v1 version.  See the user guide
-            for more details.
+            efficient but require newer versions of lance to read.  The default (None)
+            will use the latest stable version.  See the user guide for more details.
         use_legacy_format: bool, default None
             Deprecated parameter.  Use data_storage_version instead.
         storage_options : optional, dict
@@ -363,6 +363,7 @@ class LanceFragment(pa.dataset.Fragment):
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
@@ -389,7 +390,7 @@ class LanceFragment(pa.dataset.Fragment):
         Tuple[FragmentMetadata, LanceSchema]
             A new fragment with the added column(s) and the final schema.
         """
-        updater = self._fragment.updater(columns)
+        updater = self._fragment.updater(columns, batch_size)
 
         while True:
             batch = updater.next()
@@ -527,7 +528,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
-    data_storage_version: str = "legacy",
+    data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:
@@ -566,11 +567,10 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default (None)
+        will use the 2.0 version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.

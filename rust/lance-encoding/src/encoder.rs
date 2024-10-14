@@ -3,27 +3,24 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_buffer::Buffer;
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
+use crate::buffer::LanceBuffer;
+use crate::data::DataBlock;
+use crate::encodings::logical::blob::{BlobFieldEncoder, DESC_FIELD};
 use crate::encodings::logical::r#struct::StructFieldEncoder;
-use crate::encodings::physical::bitpack::{bitpack_params, BitpackingBufferEncoder};
-use crate::encodings::physical::buffers::{
-    BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder,
-};
+use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
+use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
+use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
-use crate::encodings::physical::value::{
-    parse_compression_scheme, CompressionScheme, COMPRESSION_META_KEY,
-};
 use crate::version::LanceFileVersion;
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -41,70 +38,33 @@ use crate::{
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
 
-/// An encoded buffer
-pub struct EncodedBuffer {
-    /// Buffers that make up the encoded buffer
-    ///
-    /// All of these buffers should be written to the file as one contiguous buffer
-    ///
-    /// This is a Vec to allow for zero-copy
-    ///
-    /// For example, if we are asked to write 3 primitive arrays of 1000 rows and we can write them all
-    /// as one page then this will be the value buffers from the 3 primitive arrays
-    pub parts: Vec<Buffer>,
-}
-
-// Custom impl because buffers shouldn't be included in debug output
-impl std::fmt::Debug for EncodedBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncodedBuffer")
-            .field("len", &self.parts.iter().map(|p| p.len()).sum::<usize>())
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-pub struct EncodedArrayBuffer {
-    /// The data making up the buffer
-    pub parts: Vec<Buffer>,
-    /// The index of the buffer in the page
-    pub index: u32,
-}
-
-// Custom impl because buffers shouldn't be included in debug output
-impl std::fmt::Debug for EncodedArrayBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncodedBuffer")
-            .field("len", &self.parts.iter().map(|p| p.len()).sum::<usize>())
-            .field("index", &self.index)
-            .finish()
-    }
-}
+pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
+pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
+pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
 
 /// An encoded array
 ///
 /// Maps to a single Arrow array
 ///
-/// This may contain multiple EncodedArrayBuffers.  For example, a nullable int32 array will contain two buffers,
-/// one for the null bitmap and one for the values
-#[derive(Debug, Clone)]
+/// This contains the encoded data as well as a description of the encoding that was applied which
+/// can be used to decode the data later.
+#[derive(Debug)]
 pub struct EncodedArray {
     /// The encoded buffers
-    pub buffers: Vec<EncodedArrayBuffer>,
+    pub data: DataBlock,
     /// A description of the encoding used to encode the array
     pub encoding: pb::ArrayEncoding,
 }
 
 impl EncodedArray {
-    pub fn into_parts(mut self) -> (Vec<EncodedBuffer>, pb::ArrayEncoding) {
-        self.buffers.sort_by_key(|b| b.index);
-        (
-            self.buffers
-                .into_iter()
-                .map(|b| EncodedBuffer { parts: b.parts })
-                .collect(),
-            self.encoding,
-        )
+    pub fn new(data: DataBlock, encoding: pb::ArrayEncoding) -> Self {
+        Self { data, encoding }
+    }
+
+    pub fn into_buffers(self) -> (Vec<LanceBuffer>, pb::ArrayEncoding) {
+        let buffers = self.data.into_buffers();
+        (buffers, self.encoding)
     }
 }
 
@@ -123,16 +83,6 @@ pub struct EncodedPage {
     pub column_idx: u32,
 }
 
-/// Encodes data into a single buffer
-pub trait BufferEncoder: std::fmt::Debug + Send + Sync {
-    /// Encode data
-    ///
-    /// This method may receive multiple chunks and should encode them all into
-    /// a single EncodedBuffer (though that buffer may have multiple parts).  All
-    /// parts will be written to the file as one contiguous block.
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)>;
-}
-
 #[derive(Debug)]
 pub struct EncodedBufferMeta {
     pub bits_per_value: u64,
@@ -149,31 +99,22 @@ pub struct BitpackingBufferMeta {
     pub signed: bool,
 }
 
-/// Encodes data from Arrow format into some kind of on-disk format
-///
-/// The encoder is responsible for looking at the incoming data and determining
-/// which encoding is most appropriate.  This may involve calculating statistics,
-/// etc.  It then needs to actually encode that data according to the chosen encoding.
-///
-/// The encoder may even encode the statistics as well (typically in the column
-/// metadata) so that the statistics can be used for filtering later.
+/// Encodes data from one format to another (hopefully more compact or useful) format
 ///
 /// The array encoder must be Send + Sync.  Encoding is always done on its own
 /// thread task in the background and there could potentially be multiple encode
 /// tasks running for a column at once.
-///
-/// Note: not all Arrow arrays can be encoded using an ArrayEncoder.  Some arrays
-/// will be econded into several Lance columns.  For example, a list array or a
-/// struct array.  See [FieldEncoder] for the top-level encoding entry point
 pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
     /// Encode data
     ///
-    /// This method may receive multiple chunks and should encode them into a
-    /// single EncodedPage.
-    ///
     /// The result should contain a description of the encoding that was chosen.
     /// This can be used to decode the data later.
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray>;
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray>;
 }
 
 pub fn values_column_encoding() -> pb::ColumnEncoding {
@@ -183,7 +124,7 @@ pub fn values_column_encoding() -> pb::ColumnEncoding {
 }
 
 pub struct EncodedColumn {
-    pub column_buffers: Vec<EncodedBuffer>,
+    pub column_buffers: Vec<LanceBuffer>,
     pub encoding: pb::ColumnEncoding,
     pub final_pages: Vec<EncodedPage>,
 }
@@ -197,6 +138,48 @@ impl Default for EncodedColumn {
             },
             final_pages: Default::default(),
         }
+    }
+}
+
+/// A tool to reserve space for buffers that are not in-line with the data
+///
+/// In most cases, buffers are stored in the page and referred to in the encoding
+/// metadata by their index in the page.  This keeps all buffers within a page together.
+/// As a result, most encoders should not need to use this structure.
+///
+/// In some cases (currently only the large binary encoding) there is a need to access
+/// buffers that are not in the page (becuase storing the position / offset of every page
+/// in the page metadata would be too expensive).
+///
+/// To do this you can add a buffer with `add_buffer` and then use the returned position
+/// in some way (in the large binary encoding the returned position is stored in the page
+/// data as a position / size array).
+pub struct OutOfLineBuffers {
+    position: u64,
+    buffers: Vec<LanceBuffer>,
+}
+
+impl OutOfLineBuffers {
+    pub fn new(base_position: u64) -> Self {
+        Self {
+            position: base_position,
+            buffers: Vec::new(),
+        }
+    }
+
+    pub fn add_buffer(&mut self, buffer: LanceBuffer) -> u64 {
+        let position = self.position;
+        self.position += buffer.len() as u64;
+        self.buffers.push(buffer);
+        position
+    }
+
+    pub fn take_buffers(self) -> Vec<LanceBuffer> {
+        self.buffers
+    }
+
+    pub fn reset_position(&mut self, position: u64) {
+        self.position = position;
     }
 }
 
@@ -225,18 +208,29 @@ pub trait FieldEncoder: Send {
     /// than a single disk page.
     ///
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>>;
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
+    ///
+    /// Each encode task produces a single page.  The order of these pages will be maintained
+    /// in the file (we do not worry about order between columns but all pages in the same
+    /// column should maintain order)
     ///
     /// This may be called intermittently throughout encoding but will always be called
     /// once at the end of encoding just before calling finish
-    fn flush(&mut self) -> Result<Vec<EncodeTask>>;
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>>;
     /// Finish encoding and return column metadata
     ///
     /// This is called only once, after all encode tasks have completed
     ///
     /// This returns a Vec because a single field may have created multiple columns
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
 
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
@@ -257,29 +251,9 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
 
 /// The core array encoding strategy is a set of basic encodings that
 /// are generally applicable in most scenarios.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CoreArrayEncodingStrategy {
     pub version: LanceFileVersion,
-}
-
-impl Default for CoreArrayEncodingStrategy {
-    fn default() -> Self {
-        Self {
-            version: LanceFileVersion::default_v2(),
-        }
-    }
-}
-
-fn get_compression_scheme(field_meta: Option<&HashMap<String, String>>) -> CompressionScheme {
-    field_meta
-        .map(|metadata| {
-            if let Some(compression_scheme) = metadata.get(COMPRESSION_META_KEY) {
-                parse_compression_scheme(compression_scheme).unwrap_or(CompressionScheme::None)
-            } else {
-                CompressionScheme::None
-            }
-        })
-        .unwrap_or(CompressionScheme::None)
 }
 
 const BINARY_DATATYPES: [DataType; 4] = [
@@ -296,19 +270,25 @@ impl CoreArrayEncodingStrategy {
             && data_size > 4 * 1024 * 1024
     }
 
+    fn get_field_compression(field_meta: &HashMap<String, String>) -> Option<CompressionScheme> {
+        let compression = field_meta.get(COMPRESSION_META_KEY)?;
+        Some(compression.parse::<CompressionScheme>().unwrap())
+    }
+
     fn default_binary_encoder(
         arrays: &[ArrayRef],
         data_type: &DataType,
+        field_meta: Option<&HashMap<String, String>>,
         data_size: u64,
         version: LanceFileVersion,
     ) -> Result<Box<dyn ArrayEncoder>> {
         let bin_indices_encoder =
             Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
-        let bin_bytes_encoder =
-            Self::choose_array_encoder(arrays, &DataType::UInt8, data_size, false, version, None)?;
 
-        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
-        if Self::can_use_fsst(data_type, data_size, version) {
+        let compression = field_meta.and_then(Self::get_field_compression);
+
+        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, compression));
+        if compression.is_none() && Self::can_use_fsst(data_type, data_size, version) {
             Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
         } else {
             Ok(bin_encoder)
@@ -352,7 +332,11 @@ impl CoreArrayEncodingStrategy {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder = Self::choose_array_encoder(
-                        arrays,
+                        // We need to pass arrays to this method to figure out what kind of compression to
+                        // use but we haven't actually calculated the indices yet.  For now, we just assume
+                        // worst case and use the full range.  In the future maybe we can pass in statistics
+                        // instead of the actual data
+                        &[Arc::new(UInt8Array::from_iter_values(0_u8..255_u8))],
                         &DataType::UInt8,
                         data_size,
                         false,
@@ -391,10 +375,12 @@ impl CoreArrayEncodingStrategy {
                             FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
                         ))))
                     } else {
-                        Self::default_binary_encoder(arrays, data_type, data_size, version)
+                        Self::default_binary_encoder(
+                            arrays, data_type, field_meta, data_size, version,
+                        )
                     }
                 } else {
-                    Self::default_binary_encoder(arrays, data_type, data_size, version)
+                    Self::default_binary_encoder(arrays, data_type, field_meta, data_size, version)
                 }
             }
             DataType::Struct(fields) => {
@@ -416,11 +402,38 @@ impl CoreArrayEncodingStrategy {
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                        compressed_bit_width as usize,
+                        data_type.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::default(),
+                    ))))
+                }
+            }
+
+            // TODO: for signed integers, I intend to make it a cascaded encoding, a sparse array for the negative values and very wide(bit-width) values,
+            // then a bitpacked array for the narrow(bit-width) values, I need `BitpackedForNeg` to be merged first, I am
+            // thinking about putting this sparse array in the metadata so bitpacking remain using one page buffer only.
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                        compressed_bit_width as usize,
+                        data_type.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::default(),
+                    ))))
+                }
+            }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
-                    compression_scheme: get_compression_scheme(field_meta),
-                    version,
-                }))?,
+                ValueEncoder::default(),
             )))),
         }
     }
@@ -562,85 +575,19 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
         )
     }
 }
-
-/// A trait to pick which encoding strategy will be used for a single buffer of data
-pub trait BufferEncodingStrategy: Send + Sync + std::fmt::Debug {
-    fn create_buffer_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn BufferEncoder>>;
-}
-
-#[derive(Debug)]
-pub struct CoreBufferEncodingStrategy {
-    pub compression_scheme: CompressionScheme,
-    pub version: LanceFileVersion,
-}
-
-impl CoreBufferEncodingStrategy {
-    fn try_bitpacked_encoding(
-        &self,
-        arrays: &[ArrayRef],
-        version: LanceFileVersion,
-    ) -> Option<BitpackingBufferEncoder> {
-        if version < LanceFileVersion::V2_1 {
-            return None;
-        }
-
-        // calculate the number of bits to compress array items into
-        let mut num_bits = 0;
-        let mut signed = false;
-        for arr in arrays {
-            match bitpack_params(arr.clone()) {
-                Some(params) => {
-                    num_bits = num_bits.max(params.num_bits);
-                    signed |= params.signed;
-                }
-                None => return None,
-            }
-        }
-
-        // check that the number of bits in the compressed array is less than the
-        // number of bits in the native type. Otherwise there's no point to bitpacking
-        let data_type = arrays[0].data_type();
-        let native_num_bits = 8 * data_type.byte_width() as u64;
-        if num_bits >= native_num_bits {
-            return None;
-        }
-
-        Some(BitpackingBufferEncoder::new(num_bits, signed))
-    }
-}
-
-impl BufferEncodingStrategy for CoreBufferEncodingStrategy {
-    fn create_buffer_encoder(&self, arrays: &[ArrayRef]) -> Result<Box<dyn BufferEncoder>> {
-        let data_type = arrays[0].data_type();
-        if *data_type == DataType::Boolean {
-            return Ok(Box::<BitmapBufferEncoder>::default());
-        }
-
-        if self.compression_scheme != CompressionScheme::None {
-            return Ok(Box::<CompressedBufferEncoder>::default());
-        }
-
-        if let Some(bitpacking_encoder) = self.try_bitpacked_encoding(arrays, self.version) {
-            return Ok(Box::new(bitpacking_encoder));
-        }
-
-        Ok(Box::<FlatBufferEncoder>::default())
-    }
-}
-
 /// Keeps track of the current column index and makes a mapping
 /// from field id to column index
 #[derive(Default)]
 pub struct ColumnIndexSequence {
     current_index: u32,
-    mapping: Vec<(i32, i32)>,
+    mapping: Vec<(u32, u32)>,
 }
 
 impl ColumnIndexSequence {
-    pub fn next_column_index(&mut self, field_id: i32) -> u32 {
+    pub fn next_column_index(&mut self, field_id: u32) -> u32 {
         let idx = self.current_index;
         self.current_index += 1;
-        self.mapping.push((field_id, idx as i32));
+        self.mapping.push((field_id, idx));
         idx
     }
 
@@ -699,11 +646,14 @@ pub struct CoreFieldEncodingStrategy {
     pub version: LanceFileVersion,
 }
 
+// For some reason clippy has a false negative and thinks this can be derived but
+// it can't because ArrayEncodingStrategy has no default implementation
+#[allow(clippy::derivable_impls)]
 impl Default for CoreFieldEncodingStrategy {
     fn default() -> Self {
         Self {
             array_encoding_strategy: Arc::<CoreArrayEncodingStrategy>::default(),
-            version: LanceFileVersion::default_v2(),
+            version: LanceFileVersion::default(),
         }
     }
 }
@@ -754,29 +704,39 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
         if Self::is_primitive_type(&data_type) {
-            Ok(Box::new(PrimitiveFieldEncoder::try_new(
-                options,
-                self.array_encoding_strategy.clone(),
-                column_index.next_column_index(field.id),
-                field.clone(),
-            )?))
+            let column_index = column_index.next_column_index(field.id as u32);
+            if field.metadata.contains_key(BLOB_META_KEY) {
+                let mut packed_meta = HashMap::new();
+                packed_meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+                let desc_field =
+                    Field::try_from(DESC_FIELD.clone().with_metadata(packed_meta)).unwrap();
+                let desc_encoder = Box::new(PrimitiveFieldEncoder::try_new(
+                    options,
+                    self.array_encoding_strategy.clone(),
+                    column_index,
+                    desc_field,
+                )?);
+                Ok(Box::new(BlobFieldEncoder::new(desc_encoder)))
+            } else {
+                Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                    options,
+                    self.array_encoding_strategy.clone(),
+                    column_index,
+                    field.clone(),
+                )?))
+            }
         } else {
             match data_type {
-                DataType::List(_child) => {
-                    let list_idx = column_index.next_column_index(field.id);
+                DataType::List(_child) | DataType::LargeList(_child) => {
+                    let list_idx = column_index.next_column_index(field.id as u32);
                     let inner_encoding = encoding_strategy_root.create_field_encoder(
                         encoding_strategy_root,
                         &field.children[0],
                         column_index,
                         options,
                     )?;
-                    let offsets_encoder = Arc::new(BasicEncoder::new(Box::new(
-                        ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
-                            compression_scheme: CompressionScheme::None,
-                            version: self.version,
-                        }))
-                        .unwrap(),
-                    )));
+                    let offsets_encoder =
+                        Arc::new(BasicEncoder::new(Box::new(ValueEncoder::default())));
                     Ok(Box::new(ListFieldEncoder::new(
                         inner_encoding,
                         offsets_encoder,
@@ -788,18 +748,18 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 DataType::Struct(_) => {
                     let field_metadata = &field.metadata;
                     if field_metadata
-                        .get("packed")
+                        .get(PACKED_STRUCT_LEGACY_META_KEY)
                         .map(|v| v == "true")
-                        .unwrap_or(false)
+                        .unwrap_or(field_metadata.contains_key(PACKED_STRUCT_META_KEY))
                     {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
                             self.array_encoding_strategy.clone(),
-                            column_index.next_column_index(field.id),
+                            column_index.next_column_index(field.id as u32),
                             field.clone(),
                         )?))
                     } else {
-                        let header_idx = column_index.next_column_index(field.id);
+                        let header_idx = column_index.next_column_index(field.id as u32);
                         let children_encoders = field
                             .children
                             .iter()
@@ -824,7 +784,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
                             self.array_encoding_strategy.clone(),
-                            column_index.next_column_index(field.id),
+                            column_index.next_column_index(field.id as u32),
                             field.clone(),
                         )?))
                     } else {
@@ -846,7 +806,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
 /// to field encoders for each top-level field in the batch.
 pub struct BatchEncoder {
     pub field_encoders: Vec<Box<dyn FieldEncoder>>,
-    pub field_id_to_column_index: Vec<(i32, i32)>,
+    pub field_id_to_column_index: Vec<(u32, u32)>,
 }
 
 impl BatchEncoder {
@@ -888,6 +848,7 @@ impl BatchEncoder {
 /// An encoded batch of data and a page table describing it
 ///
 /// This is returned by [`crate::encoder::encode_batch`]
+#[derive(Debug)]
 pub struct EncodedBatch {
     pub data: Bytes,
     pub page_table: Vec<Arc<ColumnInfo>>,
@@ -897,20 +858,17 @@ pub struct EncodedBatch {
 }
 
 fn write_page_to_data_buffer(page: EncodedPage, data_buffer: &mut BytesMut) -> PageInfo {
-    let mut buffers = page.array.buffers;
-    buffers.sort_by_key(|b| b.index);
-    let mut buffer_offsets_and_sizes = Vec::new();
+    let (buffers, encoding) = page.array.into_buffers();
+    let mut buffer_offsets_and_sizes = Vec::with_capacity(buffers.len());
     for buffer in buffers {
         let buffer_offset = data_buffer.len() as u64;
-        for part in buffer.parts {
-            data_buffer.extend_from_slice(&part);
-        }
+        data_buffer.extend_from_slice(&buffer);
         let size = data_buffer.len() as u64 - buffer_offset;
         buffer_offsets_and_sizes.push((buffer_offset, size));
     }
     PageInfo {
         buffer_offsets_and_sizes: Arc::from(buffer_offsets_and_sizes),
-        encoding: page.array.encoding,
+        encoding,
         num_rows: page.num_rows,
     }
 }
@@ -935,26 +893,33 @@ pub async fn encode_batch(
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
-        let mut tasks = encoder.maybe_encode(arr.clone())?;
-        tasks.extend(encoder.flush()?);
+        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
+        let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers)?;
+        tasks.extend(encoder.flush(&mut external_buffers)?);
+        for buffer in external_buffers.take_buffers() {
+            data_buffer.extend_from_slice(&buffer);
+        }
         let mut pages = HashMap::<u32, Vec<PageInfo>>::new();
         for task in tasks {
             let encoded_page = task.await?;
+            // Write external buffers first
             pages
                 .entry(encoded_page.column_idx)
                 .or_default()
                 .push(write_page_to_data_buffer(encoded_page, &mut data_buffer));
         }
-        let encoded_columns = encoder.finish().await?;
+        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
+        let encoded_columns = encoder.finish(&mut external_buffers).await?;
+        for buffer in external_buffers.take_buffers() {
+            data_buffer.extend_from_slice(&buffer);
+        }
         let num_columns = encoded_columns.len();
         for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
             let col_idx = col_idx + col_idx_offset;
             let mut col_buffer_offsets_and_sizes = Vec::new();
             for buffer in encoded_column.column_buffers {
                 let buffer_offset = data_buffer.len() as u64;
-                for part in buffer.parts {
-                    data_buffer.extend_from_slice(&part);
-                }
+                data_buffer.extend_from_slice(&buffer);
                 let size = data_buffer.len() as u64 - buffer_offset;
                 col_buffer_offsets_and_sizes.push((buffer_offset, size));
             }
@@ -979,7 +944,7 @@ pub async fn encode_batch(
     let top_level_columns = batch_encoder
         .field_id_to_column_index
         .iter()
-        .map(|(_, idx)| *idx as u32)
+        .map(|(_, idx)| *idx)
         .collect();
     Ok(EncodedBatch {
         data: data_buffer.freeze(),

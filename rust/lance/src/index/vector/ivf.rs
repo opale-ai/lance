@@ -26,7 +26,10 @@ use futures::{
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
-use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
+use lance_core::{
+    datatypes::Field, traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error,
+    Result, ROW_ID_FIELD,
+};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
@@ -361,6 +364,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let indices_to_merge = existing_indices[start_pos..].to_vec();
     let merged_num = indices_to_merge.len();
     match index_type {
+        // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                 dataset.clone(),
@@ -378,7 +382,25 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
-
+        // IVF_PQ
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
+        // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
@@ -399,7 +421,27 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
-
+        // IVF_HNSW_PQ
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                None,
+                None,
+                // TODO: get the HNSW parameters from the existing indices
+                HnswBuildParams::default(),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
         (sub_index_type, quantizer_type) => {
             return Err(Error::Index {
                 message: format!(
@@ -435,6 +477,7 @@ async fn optimize_ivf_pq_indices(
         vector_column,
         pq_index.pq.clone(),
         None,
+        true,
     );
 
     // Shuffled un-indexed data with partition.
@@ -783,7 +826,7 @@ impl VectorIndex for IVFIndex {
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
             .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -1181,7 +1224,6 @@ async fn scan_index_field_stream(
     column: &str,
 ) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
-    scanner.batch_readahead(num_cpus::get() * 2);
     scanner.project(&[column])?;
     scanner.with_row_id();
     scanner.try_into_stream().await
@@ -1354,7 +1396,7 @@ pub(crate) async fn remap_index_file(
 
     let mut task_stream = stream::iter(tasks.into_iter())
         .map(|task| task.load_and_remap(reader.clone(), index, mapping))
-        .buffered(num_cpus::get());
+        .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
         centroids: index.ivf.centroids.clone(),
@@ -1635,8 +1677,7 @@ where
         rng,
         metric_type,
         params.sample_rate,
-    )
-    .await?;
+    )?;
     Ok(IvfModel::new(FixedSizeListArray::try_new_from_values(
         centroids,
         dimension as i32,
@@ -2317,11 +2358,16 @@ mod tests {
 
         for batch in results.iter() {
             let dist = &batch["_distance"];
-            assert!(dist
-                .as_primitive::<Float32Type>()
+            dist.as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| (-2.0 * DIM as f32..0.0).contains(v)));
+                .for_each(|v| {
+                    assert!(
+                        (-2.0 * DIM as f32..0.0).contains(v),
+                        "Expect dot product value in range [-2.0 * DIM, 0.0], got: {}",
+                        v
+                    )
+                });
         }
     }
 
@@ -2714,7 +2760,7 @@ mod tests {
         let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
 
         assert!(ivf_idx
-            .ivf
+            .ivf_model()
             .centroids
             .as_ref()
             .unwrap()

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::ArrowError;
 use futures::TryStreamExt;
-use lance_core::datatypes::Schema;
+use lance_core::{
+    cache::{CapacityMode, FileMetadataCache},
+    datatypes::Schema,
+};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_io::{
     object_store::ObjectStore,
@@ -45,11 +48,17 @@ impl Default for FsFixture {
     }
 }
 
+pub struct WrittenFile {
+    pub schema: Arc<Schema>,
+    pub data: Vec<RecordBatch>,
+    pub field_id_mapping: Vec<(u32, u32)>,
+}
+
 pub async fn write_lance_file(
     data: impl RecordBatchReader,
     fs: &FsFixture,
     options: FileWriterOptions,
-) -> (Arc<Schema>, Vec<RecordBatch>) {
+) -> WrittenFile {
     let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
 
     let lance_schema = lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap();
@@ -63,18 +72,30 @@ pub async fn write_lance_file(
     for batch in &data {
         file_writer.write_batch(batch).await.unwrap();
     }
+    let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
     file_writer.add_schema_metadata("foo", "bar");
     file_writer.finish().await.unwrap();
-    (Arc::new(lance_schema), data)
+    WrittenFile {
+        schema: Arc::new(lance_schema),
+        data,
+        field_id_mapping,
+    }
+}
+
+pub fn test_cache() -> Arc<FileMetadataCache> {
+    Arc::new(FileMetadataCache::with_capacity(
+        128 * 1024 * 1024,
+        CapacityMode::Bytes,
+    ))
 }
 
 pub async fn read_lance_file(
     fs: &FsFixture,
-    decoder_middleware: DecoderMiddlewareChain,
+    decoder_middleware: Arc<DecoderMiddlewareChain>,
     filter: FilterExpression,
 ) -> Vec<RecordBatch> {
     let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
-    let file_reader = FileReader::try_open(file_scheduler, None, decoder_middleware)
+    let file_reader = FileReader::try_open(file_scheduler, None, decoder_middleware, &test_cache())
         .await
         .unwrap();
 
@@ -90,7 +111,7 @@ pub async fn read_lance_file(
 
 pub async fn count_lance_file(
     fs: &FsFixture,
-    decoder_middleware: DecoderMiddlewareChain,
+    decoder_middleware: Arc<DecoderMiddlewareChain>,
     filter: FilterExpression,
 ) -> usize {
     read_lance_file(fs, decoder_middleware, filter)

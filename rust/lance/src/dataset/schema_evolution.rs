@@ -228,6 +228,7 @@ pub(super) async fn add_columns(
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
@@ -260,7 +261,7 @@ async fn add_columns_impl(
                 }
 
                 let mut updater = fragment
-                    .updater(read_columns_ref, schemas_ref.clone())
+                    .updater(read_columns_ref, schemas_ref.clone(), None)
                     .await?;
 
                 let mut batch_index = 0;
@@ -469,6 +470,7 @@ pub(super) async fn alter_columns(
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
@@ -517,6 +519,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 

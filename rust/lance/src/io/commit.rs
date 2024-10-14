@@ -29,7 +29,7 @@ use lance_file::version::LanceFileVersion;
 use lance_table::format::{
     pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, WriterVersion,
 };
-use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
+use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
 use rand::Rng;
 use snafu::{location, Location};
@@ -121,13 +121,14 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
         transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
 
-    write_manifest_file(
+    let result = write_manifest_file(
         object_store,
         commit_handler,
         base_path,
@@ -138,10 +139,20 @@ pub(crate) async fn commit_new_dataset(
             Some(indices.clone())
         },
         write_config,
+        manifest_naming_scheme,
     )
-    .await?;
+    .await;
 
-    Ok(manifest)
+    // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
+    // if there is a conflict.
+    match result {
+        Ok(()) => Ok(manifest),
+        Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
+            uri: base_path.to_string(),
+            location: location!(),
+        }),
+        Err(CommitError::OtherError(err)) => Err(err),
+    }
 }
 
 /// Internal function to check if a manifest could use some migration.
@@ -194,7 +205,7 @@ async fn migrate_manifest(
     Ok(())
 }
 
-fn fix_data_storage_version(manifest: &mut Manifest) -> Result<()> {
+fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     let data_storage_version = manifest.data_storage_format.lance_file_version()?;
     if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
         // Due to bugs in 0.16 it is possible the dataset's data storage version does not
@@ -217,6 +228,21 @@ fn fix_data_storage_version(manifest: &mut Manifest) -> Result<()> {
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
             }
+    } else {
+        // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
+        // match the data storage version.  This is a sanity assertion to prevent data corruption.
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
+            if actual_file_version != data_storage_version {
+                return Err(Error::Internal {
+                    message: format!(
+                        "The operation added files with version {}.  However, the data storage version is {}.",
+                        actual_file_version,
+                        data_storage_version
+                    ),
+                    location: location!(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -361,7 +387,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(num_cpus::get() * 2)
+        .buffered(dataset.object_store.io_parallelism())
         .boxed();
 
     new_fragments.try_collect().await
@@ -400,6 +426,7 @@ pub(crate) async fn commit_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -473,7 +500,7 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
-        fix_data_storage_version(&mut manifest)?;
+        check_storage_version(&mut manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
@@ -489,6 +516,7 @@ pub(crate) async fn commit_transaction(
                 Some(indices.clone())
             },
             write_config,
+            manifest_naming_scheme,
         )
         .await;
 
@@ -885,6 +913,127 @@ mod tests {
             }
 
             dataset.validate().await.unwrap()
+        }
+    }
+
+    async fn get_empty_dataset() -> Dataset {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_good_concurrent_config_writes() {
+        let dataset = get_empty_dataset().await;
+
+        // Test successful concurrent insert config operations
+        let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .await
+                })
+            })
+            .collect();
+        let results = join_all(futures).await;
+
+        // Assert all succeeded
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        let dataset = dataset.checkout_version(6).await.unwrap();
+        assert_eq!(dataset.manifest.config.len(), 5);
+
+        dataset.validate().await.unwrap();
+
+        // Test successful concurrent delete operations. If multiple delete
+        // operations attempt to delete the same key, they are all successful.
+        let futures: Vec<_> = ["key1", "key1", "key1", "key2", "key2"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move { dataset.delete_config_keys(&[key]).await })
+            })
+            .collect();
+        let results = join_all(futures).await;
+
+        // Assert all succeeded
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        let dataset = dataset.checkout_version(11).await.unwrap();
+
+        // There are now two fewer keys
+        assert_eq!(dataset.manifest.config.len(), 3);
+
+        dataset.validate().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_bad_concurrent_config_writes() {
+        // If two concurrent insert config operations occur for the same key, a
+        // `CommitConflict` should be returned
+        let dataset = get_empty_dataset().await;
+
+        let futures: Vec<_> = ["key1", "key1", "key2", "key3", "key4"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .await
+                })
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        // Assert that either the first or the second operation fails
+        let mut first_operation_failed = false;
+        let error_fragment = "Commit conflict for version";
+        for (i, result) in results.into_iter().enumerate() {
+            match i {
+                0 => {
+                    if !matches!(result, Ok(Ok(_))) {
+                        first_operation_failed = true;
+                        assert!(result
+                            .unwrap()
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains(error_fragment));
+                    }
+                }
+                1 => match first_operation_failed {
+                    true => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
+                    false => assert!(result
+                        .unwrap()
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains(error_fragment)),
+                },
+                _ => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
+            }
         }
     }
 

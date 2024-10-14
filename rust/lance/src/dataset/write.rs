@@ -9,7 +9,6 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
@@ -51,7 +50,7 @@ impl TryFrom<&str> for WriteMode {
             "create" => Ok(Self::Create),
             "append" => Ok(Self::Append),
             "overwrite" => Ok(Self::Overwrite),
-            _ => Err(Error::io(
+            _ => Err(Error::invalid_input(
                 format!("Invalid write mode: {}", value),
                 location!(),
             )),
@@ -111,6 +110,13 @@ pub struct WriteParams {
     /// secondary indices need to be updated to point to new row ids.
     pub enable_move_stable_row_ids: bool,
 
+    /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
+    /// These allow constant-time lookups for the latest manifest on object storage.
+    /// This parameter has no effect on existing datasets. To migrate an existing
+    /// dataset, use the [`super::Dataset::migrate_manifest_paths_v2`] method.
+    /// Default is False.
+    pub enable_v2_manifest_paths: bool,
+
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
@@ -128,12 +134,22 @@ impl Default for WriteParams {
             commit_handler: None,
             data_storage_version: None,
             enable_move_stable_row_ids: false,
+            enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
 
 impl WriteParams {
+    /// Create a new WriteParams with the given storage version.
+    /// The other fields are set to their default values.
+    pub fn with_storage_version(version: LanceFileVersion) -> Self {
+        Self {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }
+    }
+
     pub fn storage_version_or_default(&self) -> LanceFileVersion {
         self.data_storage_version.unwrap_or_default()
     }
@@ -215,25 +231,39 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let mut storage_version = params.storage_version_or_default();
-
-    let schema = if let Some(dataset) = dataset {
-        if matches!(params.mode, WriteMode::Append) {
-            // Append mode, so we need to check compatibility
-            schema.check_compatible(dataset.schema(), &Default::default())?;
-            // If appending use storage version from dataset
-            storage_version = dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_version()?;
-            // Use the schema from the dataset, because it has the correct
-            // field ids.
-            dataset.schema()
-        } else {
-            schema
+    let (schema, storage_version) = if let Some(dataset) = dataset {
+        match params.mode {
+            WriteMode::Append | WriteMode::Create => {
+                // Append mode, so we need to check compatibility
+                schema.check_compatible(dataset.schema(), &Default::default())?;
+                // Use the schema from the dataset, because it has the correct
+                // field ids.  Use the storage version from the dataset, ignoring
+                // any version from the user.
+                (
+                    dataset.schema(),
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                )
+            }
+            WriteMode::Overwrite => {
+                // Overwrite, use the schema from the data.  If the user specified
+                // a storage version use that.  Otherwise use the version from the
+                // dataset.
+                let data_storage_version = params.data_storage_version.unwrap_or(
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                );
+                (schema, data_storage_version)
+            }
         }
     } else {
-        schema
+        // Brand new dataset, use the schema from the data and the storage version
+        // from the user or the default.
+        (schema, params.storage_version_or_default())
     };
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
@@ -339,20 +369,21 @@ impl GenericWriter for V2WriterAdapter {
             .writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(field_id, _)| *field_id)
+            .map(|(field_id, _)| *field_id as i32)
             .collect::<Vec<_>>();
         let column_indices = self
             .writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(_, column_index)| *column_index)
+            .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
+        let (major, minor) = self.writer.version().to_numbers();
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
-            MAJOR_VERSION as u32,
-            MINOR_VERSION_NEXT as u32,
+            major,
+            minor,
         );
         let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
@@ -446,6 +477,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
+    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_file::reader::FileReader;
     use lance_io::traits::Reader;
 
@@ -532,51 +564,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_size() {
-        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
-            "a",
-            DataType::Int32,
-            false,
-        )]));
+        let reader_to_frags = |data_reader: Box<dyn RecordBatchReader + Send>| {
+            let schema = data_reader.schema();
+            let data_reader =
+                data_reader.map(|rb| rb.map_err(datafusion::error::DataFusionError::from));
 
-        // Write 1024 rows and show they are split into two files
-        // 512 * 4 bytes = 2KB
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter(0..1024))],
-        )
-        .unwrap();
+            let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(data_reader),
+            ));
 
-        let write_params = WriteParams {
-            max_rows_per_file: 1024 * 10, // Won't be limited by this
-            max_rows_per_group: 512,
-            max_bytes_per_file: 2 * 1024,
-            mode: WriteMode::Create,
-            ..Default::default()
+            let write_params = WriteParams {
+                max_rows_per_file: 1024 * 1024, // Won't be limited by this
+                max_bytes_per_file: 2 * 1024,
+                mode: WriteMode::Create,
+                ..Default::default()
+            };
+
+            async move {
+                let schema = Schema::try_from(schema.as_ref()).unwrap();
+
+                let object_store = Arc::new(ObjectStore::memory());
+                write_fragments_internal(
+                    None,
+                    object_store,
+                    &Path::from("test"),
+                    &schema,
+                    data_stream,
+                    write_params,
+                )
+                .await
+            }
         };
 
-        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(std::iter::once(Ok(batch))),
-        ));
+        // The writer will not generate a new file until at enough data is *written* (not
+        // just accumulated) to justify a new file.  Since the default page size is 8MiB
+        // we actually need to generate quite a bit of data to trigger this.
+        //
+        // To avoid generating and writing millions of rows (which is a bit slow for a unit
+        // test) we can use a large data type (1KiB binary)
+        let data_reader = Box::new(
+            gen()
+                .anon_col(array::rand_fsb(1024))
+                .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
+        );
 
-        let schema = Schema::try_from(schema.as_ref()).unwrap();
-
-        let object_store = Arc::new(ObjectStore::memory());
-        let fragments = write_fragments_internal(
-            None,
-            object_store,
-            &Path::from("test"),
-            &schema,
-            data_stream,
-            write_params,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fragments.len(), 2);
+        assert_eq!(reader_to_frags(data_reader).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn test_file_write_v2() {
+    async fn test_file_write_version() {
         let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
             "a",
             DataType::Int32,
@@ -590,36 +627,55 @@ mod tests {
         )
         .unwrap();
 
-        let write_params = WriteParams {
-            data_storage_version: Some(LanceFileVersion::Stable),
-            // This parameter should be ignored
-            max_rows_per_group: 1,
-            ..Default::default()
-        };
+        let versions = vec![
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Stable,
+            LanceFileVersion::Next,
+        ];
+        for version in versions {
+            let (major, minor) = version.to_numbers();
+            let write_params = WriteParams {
+                data_storage_version: Some(version),
+                // This parameter should be ignored
+                max_rows_per_group: 1,
+                ..Default::default()
+            };
 
-        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(std::iter::once(Ok(batch))),
-        ));
+            let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(std::iter::once(Ok(batch.clone()))),
+            ));
 
-        let schema = Schema::try_from(schema.as_ref()).unwrap();
+            let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-        let object_store = Arc::new(ObjectStore::memory());
-        let fragments = write_fragments_internal(
-            None,
-            object_store,
-            &Path::from("test"),
-            &schema,
-            data_stream,
-            write_params,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fragments.len(), 1);
-        let fragment = &fragments[0];
-        assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.physical_rows, Some(1024));
-        assert_eq!(fragment.files[0].file_minor_version, 3);
+            let object_store = Arc::new(ObjectStore::memory());
+            let fragments = write_fragments_internal(
+                None,
+                object_store,
+                &Path::from("test"),
+                &schema,
+                data_stream,
+                write_params,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fragments.len(), 1);
+            let fragment = &fragments[0];
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(fragment.physical_rows, Some(1024));
+            assert_eq!(
+                fragment.files[0].file_major_version, major,
+                "version: {}",
+                version
+            );
+            assert_eq!(
+                fragment.files[0].file_minor_version, minor,
+                "version: {}",
+                version
+            );
+        }
     }
 
     #[tokio::test]

@@ -18,13 +18,16 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
-use lance_file::v2;
 use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
+use lance_file::version::LanceFileVersion;
+use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::ReadBatchParams;
@@ -261,38 +264,19 @@ mod v2_adapter {
     pub struct Reader {
         reader: Arc<v2::reader::FileReader>,
         projection: Arc<Schema>,
-        field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+        field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
     }
 
     impl Reader {
         pub fn new(
             reader: Arc<v2::reader::FileReader>,
             projection: Arc<Schema>,
-            field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+            field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         ) -> Self {
             Self {
                 reader,
                 projection,
                 field_id_to_column_idx,
-            }
-        }
-
-        pub fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
-            let column_indices = schema
-                .fields
-                .iter()
-                .map(|f| {
-                    *self.field_id_to_column_idx.get(&f.id).unwrap_or_else(|| {
-                        panic!(
-                            "attempt to project field with id {} which did not exist in the data file",
-                            f.id
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            ReaderProjection {
-                schema: Arc::new(schema.clone()),
-                column_indices,
             }
         }
     }
@@ -306,13 +290,16 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -327,13 +314,16 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
                     ReadBatchParams::RangeFull,
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -350,13 +340,16 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
                     ReadBatchParams::Indices(indices),
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -422,13 +415,72 @@ impl FileFragment {
 
     pub async fn create_from_file(
         filename: &str,
-        schema: &Schema,
+        dataset: &Dataset,
         fragment_id: usize,
         physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let fragment =
-            Fragment::with_file_legacy(fragment_id as u64, filename, schema, physical_rows);
-        Ok(fragment)
+        let filepath = dataset.data_dir().child(filename);
+        let file_version =
+            determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
+
+        if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
+            return Err(Error::io(
+                format!(
+                    "File version mismatch. Dataset verison: {:?} Fragment version: {:?}",
+                    dataset.manifest.data_storage_format.lance_file_version()?,
+                    file_version
+                ),
+                location!(),
+            ));
+        }
+
+        if file_version == LanceFileVersion::Legacy {
+            let fragment = Fragment::with_file_legacy(
+                fragment_id as u64,
+                filename,
+                dataset.schema(),
+                physical_rows,
+            );
+            Ok(fragment)
+        } else {
+            // Load the file metadata, confirm the schema is compatible, and
+            // determine the column offsets
+            let mut frag = Fragment::new(fragment_id as u64);
+            let scheduler = ScanScheduler::new(
+                dataset.object_store.clone(),
+                SchedulerConfig::max_bandwidth(&dataset.object_store),
+            );
+            let file_scheduler = scheduler.open_file(&filepath).await?;
+            let reader = v2::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                Arc::<DecoderMiddlewareChain>::default(),
+                &dataset.session.file_metadata_cache,
+            )
+            .await?;
+            // If the schemas are not compatible we can't calculate field id offsets
+            reader
+                .schema()
+                .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
+            let projection = v2::reader::ReaderProjection::from_whole_schema(dataset.schema());
+            let physical_rows = reader.metadata().num_rows as usize;
+            frag.physical_rows = Some(physical_rows);
+            frag.id = fragment_id as u64;
+
+            let column_indices = projection
+                .column_indices
+                .into_iter()
+                .map(|c| c as i32)
+                .collect();
+
+            frag.add_file(
+                filename,
+                dataset.schema().field_ids(),
+                column_indices,
+                &file_version,
+            );
+            Ok(frag)
+        }
     }
 
     pub fn dataset(&self) -> &Dataset {
@@ -536,7 +588,6 @@ impl FileFragment {
         data_file: &DataFile,
         projection: Option<&Schema>,
         scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
-        file_idx: usize,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -581,17 +632,17 @@ impl FileFragment {
                     0,
                 )
             });
-            let priority = file_idx as u64 + priority_offset;
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, priority)
+                .open_file_with_priority(&path, priority_offset)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
-                    DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                     file_metadata,
+                    &self.dataset.session.file_metadata_cache,
                 )
                 .await?,
             );
@@ -605,7 +656,7 @@ impl FileFragment {
                         if column_index < 0 {
                             None
                         } else {
-                            Some((field_id, column_index as u32))
+                            Some((field_id as u32, column_index as u32))
                         }
                     }),
             ));
@@ -620,14 +671,9 @@ impl FileFragment {
         scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
-        for (file_idx, data_file) in self.metadata.files.iter().enumerate() {
+        for data_file in &self.metadata.files {
             if let Some(reader) = self
-                .open_reader(
-                    data_file,
-                    Some(projection),
-                    scan_scheduler.clone(),
-                    file_idx,
-                )
+                .open_reader(data_file, Some(projection), scan_scheduler.clone())
                 .await?
             {
                 opened_files.push(reader);
@@ -722,7 +768,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(some_file, None, None, 0)
+            .open_reader(some_file, None, None)
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!(
@@ -816,7 +862,7 @@ impl FileFragment {
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let reader = self
-                .open_reader(data_file, None, None, 0)
+                .open_reader(data_file, None, None)
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -1081,6 +1127,7 @@ impl FileFragment {
         &self,
         columns: Option<&[T]>,
         schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
@@ -1109,11 +1156,11 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas)
+        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None).await?;
+        let mut updater = self.updater(Some(&[join_column]), None, None).await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner.collect(batch[join_column].clone()).await?;
@@ -1689,7 +1736,33 @@ impl FragmentReader {
         )
     }
 
-    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+    fn patch_range_for_deletions(&self, range: Range<u32>, dv: &DeletionVector) -> Range<u32> {
+        let mut start = range.start;
+        let mut end = range.end;
+        for val in dv.to_sorted_iter() {
+            if val <= start {
+                start += 1;
+                end += 1;
+            } else if val < end {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        start..end
+    }
+
+    fn do_read_range(
+        &self,
+        mut range: Range<u32>,
+        batch_size: u32,
+        skip_deleted_rows: bool,
+    ) -> Result<ReadBatchFutStream> {
+        if skip_deleted_rows {
+            if let Some(deletion_vector) = self.deletion_vec.as_ref() {
+                range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
+            }
+        }
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),
             batch_size,
@@ -1701,6 +1774,22 @@ impl FragmentReader {
                 )
             },
         )
+    }
+
+    /// Reads a range of rows from the fragment
+    ///
+    /// This function interprets the request as the Xth to the Nth row of the fragment (after deletions)
+    /// and will always return range.len().min(self.num_rows()) rows.
+    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, true)
+    }
+
+    /// Takes a range of rows from the fragment
+    ///
+    /// Unlike [`Self::read_range`], this function will NOT skip deleted rows.  If rows are deleted they will
+    /// be filtered or set to null.  This function may return less than range.len() rows as a result.
+    pub fn take_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, false)
     }
 
     pub fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
@@ -1715,11 +1804,11 @@ impl FragmentReader {
     // TODO: Move away from this by changing callers to support consuming a stream
     pub async fn legacy_read_range_as_batch(&self, range: Range<usize>) -> Result<RecordBatch> {
         let batches = self
-            .read_range(
+            .take_range(
                 range.start as u32..range.end as u32,
                 DEFAULT_BATCH_READ_SIZE,
             )?
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
@@ -1741,7 +1830,7 @@ impl FragmentReader {
         let batches = self
             .take(indices, u32::MAX)
             .await?
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
@@ -1755,14 +1844,16 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
+    use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreRegistry;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
+    use v2::writer::FileWriterOptions;
 
     use super::*;
-    use crate::dataset::transaction::Operation;
+    use crate::{dataset::transaction::Operation, utils::test::TestDatasetGenerator};
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1935,12 +2026,33 @@ mod tests {
         let fragment = &dataset.get_fragments()[0];
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
 
+        // Test with take_range (all rows addressible)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(fragment.schema(), with_row_id, false, None)
                 .await
                 .unwrap();
             for valid_range in [0..40, 20..40] {
+                reader
+                    .take_range(valid_range, 100)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
+            for invalid_range in [0..41, 41..42] {
+                assert!(reader.take_range(invalid_range, 100).is_err());
+            }
+        }
+
+        // Test with read_range (only non-deleted rows addressible)
+        for with_row_id in [false, true] {
+            let reader = fragment
+                .open(fragment.schema(), with_row_id, false, None)
+                .await
+                .unwrap();
+            for valid_range in [0..20, 0..10, 10..20] {
                 reader
                     .read_range(valid_range, 100)
                     .unwrap()
@@ -1949,7 +2061,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for invalid_range in [0..41, 41..42] {
+            for invalid_range in [0..21, 21..22] {
                 assert!(reader.read_range(invalid_range, 100).is_err());
             }
         }
@@ -1957,7 +2069,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fragment_scan_deletions(
+    async fn test_fragment_take_range_deletions(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
@@ -2005,7 +2117,7 @@ mod tests {
             let to_batches = |range: Range<u32>| {
                 let batch_size = range.len() as u32;
                 reader
-                    .read_range(range, batch_size)
+                    .take_range(range, batch_size)
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -2035,6 +2147,66 @@ mod tests {
                 &UInt64Array::from_iter_values(20..30)
             );
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_range_scan_deletions(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri, data_storage_version).await;
+
+        let version = dataset.version().version;
+
+        let check = |cond: &'static str, range: Range<u32>, expected: Vec<i32>| async {
+            let mut dataset = dataset.checkout_version(version).await.unwrap();
+            dataset.restore().await.unwrap();
+            dataset.delete(cond).await.unwrap();
+
+            let fragment = &dataset.get_fragments()[0];
+            let reader = fragment
+                .open(dataset.schema(), true, false, None)
+                .await
+                .unwrap();
+
+            // Using batch_size=20 here.  If we use batch_size=range.len() we get
+            // multiple batches because we might have to read from a larger range
+            // to satisfy the request
+            let mut stream = reader.read_range(range, 20).unwrap();
+            let mut batches = Vec::new();
+            while let Some(next) = stream.next().await {
+                batches.push(next.await.unwrap());
+            }
+            let schema = Arc::new(dataset.schema().into());
+            let batch = arrow_select::concat::concat_batches(&schema, batches.iter()).unwrap();
+
+            assert_eq!(batch.num_rows(), expected.len());
+            assert_eq!(
+                batch.column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from(expected)
+            );
+        };
+        // Deleting from the start
+        check("i < 5", 0..2, vec![5, 6]).await;
+        check("i < 5", 0..15, (5..20).collect()).await;
+        // Deleting from the middle
+        check("i >= 5 and i < 15", 7..9, vec![17, 18]).await;
+        check("i >= 5 and i < 15", 3..5, vec![3, 4]).await;
+        check("i >= 5 and i < 15", 3..6, vec![3, 4, 15]).await;
+        check("i >= 5 and i < 15", 5..6, vec![15]).await;
+        check("i >= 5 and i < 15", 5..10, vec![15, 16, 17, 18, 19]).await;
+        check(
+            "i >= 5 and i < 15",
+            0..10,
+            vec![0, 1, 2, 3, 4, 15, 16, 17, 18, 19],
+        )
+        .await;
+        // Deleting from the end
+        check("i >= 15", 10..15, vec![10, 11, 12, 13, 14]).await;
+        check("i >= 15", 0..15, (0..15).collect()).await;
     }
 
     #[rstest]
@@ -2176,7 +2348,7 @@ mod tests {
 
         let mut fragments: Vec<Fragment> = Vec::new();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(path, schema, idx, None)
+            let f = FileFragment::create_from_file(path, &dataset, idx, None)
                 .await
                 .unwrap();
             fragments.push(f)
@@ -2185,10 +2357,11 @@ mod tests {
         let op = Operation::Overwrite {
             schema: schema.clone(),
             fragments,
+            config_upsert_values: None,
         };
 
         let registry = Arc::new(ObjectStoreRegistry::default());
-        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry)
+        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
             .await
             .unwrap();
 
@@ -2257,7 +2430,7 @@ mod tests {
             }
 
             let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None).await.unwrap();
+            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
@@ -2285,10 +2458,11 @@ mod tests {
             let op = Operation::Overwrite {
                 fragments: vec![new_fragment],
                 schema: full_schema.clone(),
+                config_upsert_values: None,
             };
 
             let registry = Arc::new(ObjectStoreRegistry::default());
-            let dataset = Dataset::commit(test_uri, op, None, None, None, registry)
+            let dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
                 .await
                 .unwrap();
 
@@ -2396,6 +2570,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_size() {
+        // V1 ONLY
+        //
+        // This test is only for the legacy version of the file format.
+        // It ensures that the `max_rows_per_group` property is respected
+        // and this property does not exist in V2.
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2426,6 +2605,7 @@ mod tests {
             batch_iter,
             Some(WriteParams {
                 max_rows_per_group: 100,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -2495,7 +2675,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"]), None).await?;
+        let mut updater = fragment.updater(Some(&["i"]), None, None).await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;
@@ -2514,6 +2694,7 @@ mod tests {
             None,
             None,
             registry,
+            false,
         )
         .await?;
 
@@ -2531,13 +2712,15 @@ mod tests {
         let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
 
-        let actual_data = reader.legacy_read_range_as_batch(0..3).await?;
-        assert_eq!(expected_data.slice(0, 3), actual_data);
-
         let actual_data = reader
-            .legacy_read_batch_projected(0, .., &dataset.schema().project(&["s", "i"]).unwrap())
-            .await?;
-        assert_eq!(expected_data, actual_data);
+            .read_range(0..3, 3)
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(expected_data.slice(0, 3), actual_data);
 
         // Also check case of row_id.
         let expected_data = expected_data.try_with_column(
@@ -2592,5 +2775,66 @@ mod tests {
         assert!(matches!(res, Err(Error::IO { .. })));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_from_file_v2() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let make_gen = || {
+            gen()
+                .col("str", array::rand_type(&DataType::Utf8))
+                .col("int", array::rand_type(&DataType::Int32))
+        };
+
+        let batch = make_gen().into_batch_rows(RowCount::from(128)).unwrap();
+        let dataset = TestDatasetGenerator::new(vec![batch], LanceFileVersion::Stable)
+            .make_hostile(test_uri)
+            .await;
+
+        let new_data = make_gen().into_batch_rows(RowCount::from(128)).unwrap();
+        let store = ObjectStore::local();
+        let file_path = dataset.data_dir().child("some_file.lance");
+        let object_writer = store.create(&file_path).await.unwrap();
+        let mut file_writer =
+            v2::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+        file_writer.write_batch(&new_data).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let frag = FileFragment::create_from_file("some_file.lance", &dataset, 0, Some(128))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Fragment::try_infer_version(&[frag.clone()])
+                .unwrap()
+                .unwrap(),
+            LanceFileVersion::Stable.resolve()
+        );
+
+        let op = Operation::Append {
+            fragments: vec![frag],
+        };
+        let object_store_registry = Arc::new(ObjectStoreRegistry::default());
+        let dataset = Dataset::commit(
+            &dataset.uri,
+            op,
+            Some(dataset.version().version),
+            None,
+            None,
+            object_store_registry,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset
+                .count_rows(Some("int IS NOT NULL".to_string()))
+                .await
+                .unwrap(),
+            256
+        );
     }
 }

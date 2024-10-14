@@ -12,7 +12,7 @@ use log::trace;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
@@ -95,7 +95,7 @@ struct BitmapDecoder {
 }
 
 impl PrimitivePageDecoder for BitmapDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let mut rows_to_skip = rows_to_skip;
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
 
@@ -114,17 +114,18 @@ impl PrimitivePageDecoder for BitmapDecoder {
         }
 
         let bool_buffer = dest_builder.finish().into_inner();
-        Ok(Box::new(FixedWidthDataBlock {
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             data: LanceBuffer::from(bool_buffer),
             bits_per_value: 1,
             num_values: num_rows,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use arrow_schema::{DataType, Field};
     use bytes::Bytes;
@@ -138,7 +139,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test]

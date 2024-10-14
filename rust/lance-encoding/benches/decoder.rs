@@ -65,8 +65,8 @@ fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_primitive");
     for data_type in PRIMITIVE_TYPES {
         let data = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
+            .anon_col(lance_datagen::array::rand_type(data_type))
+            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024 * 1024))
             .unwrap();
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
@@ -88,7 +88,7 @@ fn bench_decode(c: &mut Criterion) {
                     .block_on(lance_encoding::decoder::decode_batch(
                         &encoded,
                         &FilterExpression::no_filter(),
-                        &DecoderMiddlewareChain::default(),
+                        Arc::<DecoderMiddlewareChain>::default(),
                     ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
@@ -96,6 +96,7 @@ fn bench_decode(c: &mut Criterion) {
         });
     }
 }
+
 fn bench_decode_fsl(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive_fsl");
@@ -127,7 +128,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                     .block_on(lance_encoding::decoder::decode_batch(
                         &encoded,
                         &FilterExpression::no_filter(),
-                        &DecoderMiddlewareChain::default(),
+                        Arc::<DecoderMiddlewareChain>::default(),
                     ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
@@ -183,7 +184,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
                     &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -218,7 +219,6 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
         .iter()
         .map(|field| {
             if matches!(field.data_type(), &DataType::Struct(_)) {
-                println!("Match");
                 let mut metadata = HashMap::new();
                 metadata.insert("packed".to_string(), "true".to_string());
                 let field =
@@ -253,7 +253,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
                     &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -261,6 +261,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
@@ -300,7 +301,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
                     &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -313,7 +314,7 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct, 
+    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding);
 
 // Non-linux version does not support pprof.

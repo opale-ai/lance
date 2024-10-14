@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_buffer::bit_util;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
@@ -31,7 +30,7 @@ use log::debug;
 use snafu::{location, Location};
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
-use crate::dataset::scanner::DEFAULT_FRAGMENT_READAHEAD;
+use crate::dataset::scanner::{DEFAULT_FRAGMENT_READAHEAD, LEGACY_DEFAULT_FRAGMENT_READAHEAD};
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
@@ -133,7 +132,7 @@ impl LanceStream {
                 projection,
                 read_size,
                 batch_readahead,
-                fragment_readahead.unwrap_or(DEFAULT_FRAGMENT_READAHEAD),
+                fragment_readahead.unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD),
                 with_row_id,
                 with_row_address,
                 with_make_deletions_null,
@@ -156,19 +155,20 @@ impl LanceStream {
         io_buffer_size: u64,
     ) -> Result<Self> {
         let project_schema = projection.clone();
-        let io_parallelism = dataset.object_store.io_parallelism()?;
+        let io_parallelism = dataset.object_store.io_parallelism();
+        // First, use the value specified by the user in the call
+        // Second, use the default from the environment variable, if specified
+        // Finally, use a default based on the io_parallelism
+        //
+        // Opening a fragment is pretty cheap so we can open a lot of them at once
+        // Scheduling a fragment is also pretty cheap
+        // The scheduler backpressure will control fragment priority and total data
+        //
+        // As a result, we don't really need to worry too much about fragment readahead.  We also want this
+        // to be pretty high.  While we are reading one set of fragments we should be scheduling the next set
+        // this should help ensure that we don't have breaks in I/O
         let frag_parallelism = fragment_parallelism
-            .unwrap_or_else(|| {
-                // This is somewhat aggressive.  It assumes a single page per column.  If there are many pages per
-                // column then we probably don't need to read that many files.  It's a little tricky to get the right
-                // answer though and so we err on the side of speed over memory.  Users can tone down fragment_parallelism
-                // by hand if needed.
-                if projection.fields.is_empty() {
-                    io_parallelism as usize
-                } else {
-                    bit_util::ceil(io_parallelism as usize, projection.fields.len())
-                }
-            })
+            .unwrap_or((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             // fragment_readhead=0 doesn't make sense so we just bump it to 1
             .max(1);
         debug!(
@@ -237,15 +237,8 @@ impl LanceStream {
             },
         );
 
-        let mut priorities = Vec::with_capacity(file_fragments.len());
-        let mut current_priority = 0;
-        for frag in &file_fragments {
-            priorities.push(current_priority);
-            current_priority += frag.fragment.num_data_files();
-        }
-
-        let batches = stream::iter(file_fragments.into_iter().zip(priorities))
-            .map(move |(file_fragment, priority)| {
+        let batches = stream::iter(file_fragments.into_iter().enumerate())
+            .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
                 #[allow(clippy::type_complexity)]

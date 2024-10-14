@@ -3,7 +3,8 @@
 
 use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
-use arrow_array::{make_array, ArrayRef};
+use arrow::array::AsArray;
+use arrow_array::{make_array, Array, ArrayRef};
 use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
@@ -14,6 +15,7 @@ use snafu::{location, Location};
 use lance_core::{datatypes::Field, Result};
 
 use crate::{
+    data::DataBlock,
     decoder::{
         DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
         PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine,
@@ -21,7 +23,7 @@ use crate::{
     },
     encoder::{
         ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
-        FieldEncoder,
+        FieldEncoder, OutOfLineBuffers,
     },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
@@ -30,6 +32,7 @@ use crate::{
 struct PrimitivePage {
     scheduler: Box<dyn PageScheduler>,
     num_rows: u64,
+    page_index: u32,
 }
 
 /// A field scheduler for primitive fields
@@ -60,9 +63,13 @@ impl PrimitiveFieldScheduler {
     ) -> Self {
         let page_schedulers = pages
             .iter()
+            .enumerate()
             // Buggy versions of Lance could sometimes create empty pages
-            .filter(|page| page.num_rows > 0)
-            .map(|page| {
+            .filter(|(page_index, page)| {
+                log::trace!("Skipping empty page with index {}", page_index);
+                page.num_rows > 0
+            })
+            .map(|(page_index, page)| {
                 let page_buffers = PageBuffers {
                     column_buffers: buffers,
                     positions_and_sizes: &page.buffer_offsets_and_sizes,
@@ -72,6 +79,7 @@ impl PrimitiveFieldScheduler {
                 PrimitivePage {
                     scheduler,
                     num_rows: page.num_rows,
+                    page_index: page_index as u32,
                 }
             })
             .collect::<Vec<_>>();
@@ -159,10 +167,13 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
 
         let num_rows_in_next = ranges_in_page.iter().map(|r| r.end - r.start).sum();
         trace!(
-            "Scheduling {} rows across {} ranges from page with {} rows",
+            "Scheduling {} rows across {} ranges from page with {} rows (priority={}, column_index={}, page_index={})",
             num_rows_in_next,
             ranges_in_page.len(),
-            cur_page.num_rows
+            cur_page.num_rows,
+            priority.current_priority(),
+            self.scheduler.column_index,
+            cur_page.page_index,
         );
 
         self.global_row_offset += cur_page.num_rows;
@@ -182,6 +193,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             rows_drained: 0,
             num_rows: num_rows_in_next,
             should_validate: self.scheduler.should_validate,
+            page_index: cur_page.page_index,
         };
 
         let decoder = Box::new(logical_decoder);
@@ -213,6 +225,15 @@ impl FieldScheduler for PrimitiveFieldScheduler {
             ranges.to_vec(),
         )))
     }
+
+    fn initialize<'a>(
+        &'a self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        // 2.0 schedulers do not need to initialize
+        std::future::ready(Ok(())).boxed()
+    }
 }
 
 pub struct PrimitiveFieldDecoder {
@@ -223,6 +244,7 @@ pub struct PrimitiveFieldDecoder {
     num_rows: u64,
     rows_drained: u64,
     column_index: u32,
+    page_index: u32,
 }
 
 impl PrimitiveFieldDecoder {
@@ -240,6 +262,7 @@ impl PrimitiveFieldDecoder {
             num_rows,
             rows_drained: 0,
             column_index: u32::MAX,
+            page_index: u32::MAX,
         }
     }
 }
@@ -268,9 +291,30 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             .physical_decoder
             .decode(self.rows_to_skip, self.rows_to_take)?;
 
-        Ok(make_array(
-            block.into_arrow(self.data_type, self.should_validate)?,
-        ))
+        let array = make_array(block.into_arrow(self.data_type.clone(), self.should_validate)?);
+
+        // This is a bit of a hack to work around https://github.com/apache/arrow-rs/issues/6302
+        //
+        // We change from nulls-in-dictionary (storage format) to nulls-in-indices (arrow-rs preferred
+        // format)
+        //
+        // The calculation of logical_nulls is not free and would be good to avoid in the future
+        if let DataType::Dictionary(_, _) = self.data_type {
+            let dict = array.as_any_dictionary();
+            if let Some(nulls) = array.logical_nulls() {
+                let new_indices = dict.keys().to_data();
+                let new_array = make_array(
+                    new_indices
+                        .into_builder()
+                        .nulls(Some(nulls))
+                        .add_child_data(dict.values().to_data())
+                        .data_type(dict.data_type().clone())
+                        .build()?,
+                );
+                return Ok(new_array);
+            }
+        }
+        Ok(array)
     }
 }
 
@@ -279,9 +323,10 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         log::trace!(
-            "primitive wait for more than {} rows on column {} (page has {} rows)",
+            "primitive wait for more than {} rows on column {} and page {} (page has {} rows)",
             loaded_need,
             self.column_index,
+            self.page_index,
             self.num_rows
         );
         async move {
@@ -446,14 +491,16 @@ impl PrimitiveFieldEncoder {
             .array_encoding_strategy
             .create_array_encoder(&arrays, &self.field)?;
         let column_idx = self.column_index;
+        let data_type = self.field.data_type();
 
         Ok(tokio::task::spawn(async move {
-            let num_rows = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let data = DataBlock::from_arrays(&arrays, num_values);
             let mut buffer_index = 0;
-            let array = encoder.encode(&arrays, &mut buffer_index)?;
+            let array = encoder.encode(data, &data_type, &mut buffer_index)?;
             Ok(EncodedPage {
                 array,
-                num_rows,
+                num_rows: num_values,
                 column_idx,
             })
         })
@@ -501,7 +548,11 @@ impl PrimitiveFieldEncoder {
 
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        _external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.insert(array) {
             Ok(self.do_flush(arrays)?)
         } else {
@@ -510,7 +561,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     }
 
     // If there is any data left in the buffer then create an encode task from it
-    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+    fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
             Ok(self.do_flush(arrays)?)
         } else {
@@ -522,7 +573,10 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         1
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+    fn finish(
+        &mut self,
+        _external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
         std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
     }
 }

@@ -1,27 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
+use arrow::array::make_comparator;
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::Result;
+use lance_core::{
+    cache::{CapacityMode, FileMetadataCache},
+    Result,
+};
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
+    buffer::LanceBuffer,
     decoder::{
         BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
         DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedBuffer,
-        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedColumn,
+        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
     version::LanceFileVersion,
@@ -49,13 +54,7 @@ impl EncodingsIo for SimulatedScheduler {
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         let data = ranges
             .into_iter()
-            .map(|range| {
-                if range.is_empty() {
-                    // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
-                    panic!("Empty request")
-                }
-                self.data.slice(range.start as usize..range.end as usize)
-            })
+            .map(|range| self.data.slice(range.start as usize..range.end as usize))
             .collect();
 
         log::trace!("Scheduled request with priority {}", priority);
@@ -68,34 +67,80 @@ impl EncodingsIo for SimulatedScheduler {
     }
 }
 
+fn column_indices_from_schema_helper(
+    fields: &[FieldRef],
+    column_indices: &mut Vec<u32>,
+    column_counter: &mut u32,
+) {
+    column_indices.push(*column_counter);
+    *column_counter += 1;
+    for field in fields {
+        match field.data_type() {
+            DataType::Struct(fields) => {
+                column_indices_from_schema_helper(fields.as_ref(), column_indices, column_counter);
+            }
+            DataType::List(inner) => {
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
+            }
+            DataType::LargeList(inner) => {
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
+            }
+            DataType::FixedSizeList(inner, _) => {
+                // FSL(primitive) does not get its own column
+                column_indices.pop();
+                *column_counter -= 1;
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
+            }
+            _ => {
+                column_indices_from_schema_helper(&[], column_indices, column_counter);
+            }
+        }
+    }
+}
+
+fn column_indices_from_schema(schema: &Schema) -> Vec<u32> {
+    let mut column_indices = Vec::new();
+    let mut column_counter = 0;
+    column_indices_from_schema_helper(schema.fields(), &mut column_indices, &mut column_counter);
+    column_indices
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn test_decode(
     num_rows: u64,
     batch_size: u32,
     schema: &Schema,
-    column_indices: &[u32],
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
-    io: &Arc<dyn EncodingsIo>,
+    io: Arc<dyn EncodingsIo>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
     ) -> (SimpleStructDecoder, BoxFuture<'static, ()>),
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let decode_and_validate =
-        DecoderMiddlewareChain::new().add_strategy(Arc::new(CoreFieldDecoderStrategy {
+    let decode_and_validate = Arc::new(DecoderMiddlewareChain::new().add_strategy(Arc::new(
+        CoreFieldDecoderStrategy {
             validate_data: true,
-        }));
+        },
+    )));
+    let cache = Arc::new(FileMetadataCache::with_capacity(
+        128 * 1024 * 1024,
+        CapacityMode::Bytes,
+    ));
+    let column_indices = column_indices_from_schema(schema);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
-        column_indices,
+        &column_indices,
         column_infos,
         &Vec::new(),
         num_rows,
-        &decode_and_validate,
+        decode_and_validate,
         io,
+        cache,
+        &FilterExpression::no_filter(),
     )
+    .await
     .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -114,7 +159,29 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
-            assert_eq!(&expected, actual);
+            if &expected != actual {
+                if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
+                {
+                    // We can't just assert_eq! because the error message is not very helpful.  This gives us a bit
+                    // more information about where the mismatch is.
+                    for i in 0..expected.len() {
+                        if !matches!(comparator(i, i), Ordering::Equal) {
+                            panic!(
+                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            i,
+                            expected,
+                            actual,
+                            expected.slice(i, 1),
+                            actual.slice(i, 1)
+                        );
+                        }
+                    }
+                } else {
+                    // Some arrays (like the null type) don't have a comparator so we just re-run the normal comparison
+                    // and let it assert
+                    assert_eq!(&expected, actual);
+                }
+            }
         }
         offset += batch_size as usize;
     }
@@ -141,15 +208,14 @@ impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
 }
 
 /// Given a field this will test the round trip encoding and decoding of random data
-pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<String, String>) {
-    let field = field.with_metadata(metadata);
+pub async fn check_round_trip_encoding_random(field: Field) {
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
     check_round_trip_encoding_generated(
         field,
         Box::new(array_generator_provider),
-        LanceFileVersion::default_v2(),
+        LanceFileVersion::default(),
     )
     .await;
 }
@@ -199,6 +265,8 @@ fn supports_nulls(data_type: &DataType) -> bool {
     !matches!(data_type, DataType::Struct(_))
 }
 
+type EncodingVerificationFn = dyn Fn(&[EncodedColumn]);
+
 // The default will just test the full read
 #[derive(Clone)]
 pub struct TestCases {
@@ -207,6 +275,8 @@ pub struct TestCases {
     batch_size: u32,
     skip_validation: bool,
     max_page_size: Option<u64>,
+    file_version: LanceFileVersion,
+    verify_encoding: Option<Arc<EncodingVerificationFn>>,
 }
 
 impl Default for TestCases {
@@ -217,6 +287,8 @@ impl Default for TestCases {
             indices: Vec::new(),
             skip_validation: false,
             max_page_size: None,
+            file_version: LanceFileVersion::default(),
+            verify_encoding: None,
         }
     }
 }
@@ -250,6 +322,22 @@ impl TestCases {
     fn get_max_page_size(&self) -> u64 {
         self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
     }
+
+    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
+        self.file_version = version;
+        self
+    }
+
+    pub fn with_verify_encoding(mut self, verify_encoding: Arc<EncodingVerificationFn>) -> Self {
+        self.verify_encoding = Some(verify_encoding);
+        self
+    }
+
+    fn verify_encoding(&self, encoding: &[EncodedColumn]) {
+        if let Some(verify_encoding) = self.verify_encoding.as_ref() {
+            verify_encoding(encoding);
+        }
+    }
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -268,7 +356,12 @@ pub async fn check_round_trip_encoding_of_data(
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy {
+                version: test_cases.file_version,
+            }),
+            version: test_cases.file_version,
+        };
         let mut column_index_seq = ColumnIndexSequence::default();
         let encoding_options = EncodingOptions {
             cache_bytes_per_column: page_size,
@@ -302,18 +395,21 @@ impl SimulatedWriter {
         }
     }
 
-    fn write_buffer(&mut self, buffer: EncodedBuffer) -> (u64, u64) {
+    fn write_buffer(&mut self, buffer: LanceBuffer) -> (u64, u64) {
         let offset = self.encoded_data.len() as u64;
-        for part in buffer.parts.iter() {
-            self.encoded_data.extend_from_slice(part);
-        }
+        self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
         (offset, size)
     }
 
+    fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
+        self.encoded_data.extend_from_slice(&buffer);
+    }
+
     fn write_page(&mut self, encoded_page: EncodedPage) {
         trace!("Encoded page {:?}", encoded_page);
-        let (page_buffers, page_encoding) = encoded_page.array.into_parts();
+        let page_buffers = encoded_page.array.data.into_buffers();
+        let page_encoding = encoded_page.array.encoding;
         let buffer_offsets_and_sizes = page_buffers
             .into_iter()
             .map(|b| self.write_buffer(b))
@@ -328,6 +424,10 @@ impl SimulatedWriter {
         let col_idx = encoded_page.column_idx as usize;
         self.page_infos[col_idx].push(page_info);
     }
+
+    fn new_external_buffers(&self) -> OutOfLineBuffers {
+        OutOfLineBuffers::new(self.encoded_data.len() as u64)
+    }
 }
 
 /// This is the inner-most check function that actually runs the round trip and tests it
@@ -340,18 +440,33 @@ async fn check_round_trip_encoding_inner(
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
-        for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
-            let encoded_page = encode_task.await.unwrap();
-            writer.write_page(encoded_page);
+        let mut external_buffers = writer.new_external_buffers();
+        let encode_tasks = encoder
+            .maybe_encode(arr.clone(), &mut external_buffers)
+            .unwrap();
+        for buffer in external_buffers.take_buffers() {
+            writer.write_lance_buffer(buffer);
+        }
+        for task in encode_tasks {
+            writer.write_page(task.await.unwrap());
         }
     }
 
-    for encode_task in encoder.flush().unwrap() {
-        let encoded_page = encode_task.await.unwrap();
-        writer.write_page(encoded_page);
+    let mut external_buffers = writer.new_external_buffers();
+    let encode_tasks = encoder.flush(&mut external_buffers).unwrap();
+    for buffer in external_buffers.take_buffers() {
+        writer.write_lance_buffer(buffer);
+    }
+    for task in encode_tasks {
+        writer.write_page(task.await.unwrap());
     }
 
-    let encoded_columns = encoder.finish().await.unwrap();
+    let mut external_buffers = writer.new_external_buffers();
+    let encoded_columns = encoder.finish(&mut external_buffers).await.unwrap();
+    test_cases.verify_encoding(&encoded_columns);
+    for buffer in external_buffers.take_buffers() {
+        writer.write_lance_buffer(buffer);
+    }
     let mut column_infos = Vec::new();
     for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
         for page in encoded_column.final_pages {
@@ -392,10 +507,9 @@ async fn check_round_trip_encoding_inner(
         num_rows,
         test_cases.batch_size,
         &schema,
-        &[0],
         &column_infos,
         concat_data.clone(),
-        &scheduler_copy.clone(),
+        scheduler_copy.clone(),
         |mut decode_scheduler, tx| {
             #[allow(clippy::single_range_in_vec_init)]
             let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
@@ -428,10 +542,9 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
-            &[0],
             &column_infos,
             expected,
-            &scheduler.clone(),
+            scheduler.clone(),
             |mut decode_scheduler, tx| {
                 #[allow(clippy::single_range_in_vec_init)]
                 let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
@@ -475,10 +588,9 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
-            &[0],
             &column_infos,
             expected,
-            &scheduler.clone(),
+            scheduler.clone(),
             |mut decode_scheduler, tx| {
                 let root_decoder = decode_scheduler.new_root_decoder_indices(&indices);
                 (

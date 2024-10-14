@@ -11,6 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -24,7 +25,8 @@ use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
-    commit_handler_from_url, CommitError, CommitHandler, CommitLock, ManifestLocation,
+    commit_handler_from_url, migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock,
+    ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
@@ -99,6 +101,7 @@ pub struct Dataset {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
+    pub manifest_naming_scheme: ManifestNamingScheme,
 }
 
 /// Dataset Version
@@ -329,17 +332,18 @@ impl Dataset {
         }
     }
 
+    /// Check out the latest version of the dataset
+    pub async fn checkout_latest(&mut self) -> Result<()> {
+        self.manifest = Arc::new(self.latest_manifest().await?);
+        Ok(())
+    }
+
     async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
-        let manifest_file = self
+        let manifest_location = self
             .commit_handler
-            .resolve_version(&base_path, version, &self.object_store.inner)
+            .resolve_version_location(&base_path, version, &self.object_store.inner)
             .await?;
-        let manifest_location = ManifestLocation {
-            version,
-            path: manifest_file,
-            size: None,
-        };
         let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -348,6 +352,7 @@ impl Dataset {
             manifest,
             self.session.clone(),
             self.commit_handler.clone(),
+            manifest_location.naming_scheme,
         )
         .await
     }
@@ -430,6 +435,7 @@ impl Dataset {
         manifest: Manifest,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
+        manifest_naming_scheme: ManifestNamingScheme,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -444,6 +450,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            manifest_naming_scheme,
         })
     }
 
@@ -513,7 +520,23 @@ impl Dataset {
             )
         };
 
-        let mut storage_version = params.storage_version_or_default();
+        let mut storage_version = match (params.mode, dataset.as_ref()) {
+            (WriteMode::Append, Some(dataset)) => {
+                // If appending to an existing dataset, always use the dataset version
+                let m = dataset.manifest.as_ref();
+                m.data_storage_format.lance_file_version()?
+            }
+            (WriteMode::Overwrite, Some(dataset)) => {
+                // If overwriting an existing dataset, allow the user to specify but use
+                // the existing version if they don't
+                params.data_storage_version.map(Ok).unwrap_or_else(|| {
+                    let m = dataset.manifest.as_ref();
+                    m.data_storage_format.lance_file_version()
+                })?
+            }
+            // Otherwise (no existing dataset) fallback to the default if the user didn't specify
+            _ => params.storage_version_or_default(),
+        };
 
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
@@ -530,6 +553,14 @@ impl Dataset {
                 storage_version = m.data_storage_format.lance_file_version()?;
             }
         }
+
+        let manifest_naming_scheme = if let Some(d) = dataset.as_ref() {
+            d.manifest_naming_scheme
+        } else if params.enable_v2_manifest_paths {
+            ManifestNamingScheme::V2
+        } else {
+            ManifestNamingScheme::V1
+        };
 
         let params = params; // discard mut
 
@@ -559,7 +590,11 @@ impl Dataset {
         .await?;
 
         let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                fragments,
+                config_upsert_values: None,
+            },
             WriteMode::Append => Operation::Append { fragments },
         };
 
@@ -582,6 +617,7 @@ impl Dataset {
                 &transaction,
                 &manifest_config,
                 &Default::default(),
+                manifest_naming_scheme,
             )
             .await?
         } else {
@@ -591,6 +627,7 @@ impl Dataset {
                 &base,
                 &transaction,
                 &manifest_config,
+                manifest_naming_scheme,
             )
             .await?
         };
@@ -605,6 +642,7 @@ impl Dataset {
             session: Arc::new(Session::default()),
             commit_handler,
             tags,
+            manifest_naming_scheme,
         })
     }
 
@@ -675,6 +713,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -761,6 +800,7 @@ impl Dataset {
                 &transaction,
                 &Default::default(),
                 &Default::default(),
+                self.manifest_naming_scheme,
             )
             .await?,
         );
@@ -832,6 +872,12 @@ impl Dataset {
     /// * `operation` - A description of the change to commit
     /// * `read_version` - The version of the dataset that this change is based on
     /// * `store_params` Parameters controlling object store access to the manifest
+    /// * `enable_v2_manifest_paths`: If set to true, and this is a new dataset, uses the new v2 manifest
+    ///   paths. These allow constant-time lookups for the latest manifest on object storage.
+    ///   This parameter has no effect on existing datasets. To migrate an existing
+    ///   dataset, use the [`Self::migrate_manifest_paths_v2`] method. WARNING: turning
+    ///   this on will make the dataset unreadable for older versions of Lance
+    ///   (prior to 0.17.0). Default is False.
     pub async fn commit(
         base_uri: &str,
         operation: Operation,
@@ -839,6 +885,7 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
         object_store_registry: Arc<ObjectStoreRegistry>,
+        enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -892,6 +939,14 @@ impl Dataset {
             None
         };
 
+        let manifest_naming_scheme = if let Some(ds) = &dataset {
+            ds.manifest_naming_scheme
+        } else if enable_v2_manifest_paths {
+            ManifestNamingScheme::V2
+        } else {
+            ManifestNamingScheme::V1
+        };
+
         let transaction = Transaction::new(read_version, operation, None);
 
         let manifest = if let Some(dataset) = &dataset {
@@ -902,6 +957,7 @@ impl Dataset {
                 &transaction,
                 &Default::default(),
                 &Default::default(),
+                manifest_naming_scheme,
             )
             .await?
         } else {
@@ -911,6 +967,7 @@ impl Dataset {
                 &base,
                 &transaction,
                 &Default::default(),
+                manifest_naming_scheme,
             )
             .await?
         };
@@ -926,6 +983,7 @@ impl Dataset {
             session: Arc::new(Session::default()),
             commit_handler,
             tags,
+            manifest_naming_scheme,
         })
     }
 
@@ -1054,7 +1112,7 @@ impl Dataset {
                 let new_fragment = f.delete(predicate).await?.map(|f| f.metadata);
                 Ok((old_fragment, new_fragment))
             })
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(get_num_compute_intensive_cpus())
             // Drop the fragments that were deleted.
             .try_for_each(|(old_fragment, new_fragment)| {
                 if let Some(new_fragment) = new_fragment {
@@ -1085,6 +1143,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -1096,7 +1155,7 @@ impl Dataset {
     pub async fn count_deleted_rows(&self) -> Result<usize> {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.count_deletions().await })
-            .buffer_unordered(num_cpus::get() * 4)
+            .buffer_unordered(self.object_store.io_parallelism())
             .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
             .await
     }
@@ -1212,7 +1271,7 @@ impl Dataset {
     pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.physical_rows().await })
-            .buffered(num_cpus::get() * 4)
+            .buffered(self.object_store.io_parallelism())
             .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
             .await
@@ -1245,10 +1304,47 @@ impl Dataset {
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })
-            .buffer_unordered(num_cpus::get() * 4)
+            .buffer_unordered(self.object_store.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
 
+        Ok(())
+    }
+
+    /// Migrate the dataset to use the new manifest path scheme.
+    ///
+    /// This function will rename all V1 manifests to [ManifestNamingScheme::V2].
+    /// These paths provide more efficient opening of datasets with many versions
+    /// on object stores.
+    ///
+    /// This function is idempotent, and can be run multiple times without
+    /// changing the state of the object store.
+    ///
+    /// However, it should not be run while other concurrent operations are happening.
+    /// And it should also run until completion before resuming other operations.
+    ///
+    /// ```rust
+    /// # use lance::dataset::Dataset;
+    /// # use lance_table::io::commit::ManifestNamingScheme;
+    /// # use lance_datagen::{array, RowCount, BatchCount};
+    /// # use arrow_array::types::Int32Type;
+    /// # let data = lance_datagen::gen()
+    /// #  .col("key", array::step::<Int32Type>())
+    /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    /// # let fut = async {
+    /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V1);
+    ///
+    /// dataset.migrate_manifest_paths_v2().await.unwrap();
+    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V2);
+    /// # };
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
+    /// ```
+    pub async fn migrate_manifest_paths_v2(&mut self) -> Result<()> {
+        migrate_scheme_to_v2(self.object_store(), &self.base).await?;
+        // We need to re-open.
+        let latest_version = self.latest_version_id().await?;
+        *self = self.checkout_version(latest_version).await?;
         Ok(())
     }
 }
@@ -1384,6 +1480,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -1411,6 +1508,63 @@ impl Dataset {
     ) -> Result<()> {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
+    }
+
+    /// Update key-value pairs in config.
+    pub async fn update_config(
+        &mut self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateConfig {
+                upsert_values: Some(HashMap::from_iter(upsert_values)),
+                delete_keys: None,
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
+    /// Delete keys from the config.
+    pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateConfig {
+                upsert_values: None,
+                delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
     }
 }
 
@@ -1454,6 +1608,7 @@ pub(crate) async fn write_manifest_file(
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
+    naming_scheme: ManifestNamingScheme,
 ) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
@@ -1470,6 +1625,7 @@ pub(crate) async fn write_manifest_file(
             base_path,
             object_store,
             write_manifest_file_to_path,
+            naming_scheme,
         )
         .await?;
 
@@ -1962,6 +2118,7 @@ mod tests {
                 use_legacy_format: None,
                 storage_format: None,
             },
+            dataset.manifest_naming_scheme,
         )
         .await
         .unwrap();
@@ -2628,6 +2785,105 @@ mod tests {
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 
+    fn assert_all_manifests_use_scheme(test_dir: &TempDir, scheme: ManifestNamingScheme) {
+        let entries_names = test_dir
+            .path()
+            .join("_versions")
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            entries_names
+                .iter()
+                .all(|name| ManifestNamingScheme::detect_scheme(name) == Some(scheme)),
+            "Entries: {:?}",
+            entries_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_manifest_path_create() {
+        // Can create a dataset, using V2 paths
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(10))
+            .unwrap();
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema().clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_v2_manifest_paths: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+
+        // Appending to it will continue to use those paths
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema().clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+
+        UpdateBuilder::new(Arc::new(dataset))
+            .update_where("key = 5")
+            .unwrap()
+            .set("key", "200")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+    }
+
+    #[tokio::test]
+    async fn test_v2_manifest_path_commit() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let operation = Operation::Overwrite {
+            fragments: vec![],
+            schema,
+            config_upsert_values: None,
+        };
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = Dataset::commit(
+            test_uri,
+            operation,
+            None,
+            None,
+            None,
+            Arc::new(ObjectStoreRegistry::default()),
+            true, // enable_v2_manifest_paths
+        )
+        .await
+        .unwrap();
+
+        assert!(dataset.manifest_naming_scheme == ManifestNamingScheme::V2);
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_merge(
@@ -3023,6 +3279,11 @@ mod tests {
         assert_eq!(fragments[0].metadata.deletion_file, None);
         assert_eq!(dataset.manifest, original_manifest);
 
+        // Checkout latest and then go back.
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+        let mut dataset = dataset.checkout_version(1).await.unwrap();
+
         // Restore to a previous version
         dataset.restore().await.unwrap();
         assert_eq!(dataset.manifest.version, 3);
@@ -3036,6 +3297,38 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_update_config() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let mut desired_config = HashMap::new();
+        desired_config.insert("lance:test".to_string(), "value".to_string());
+        desired_config.insert("other-key".to_string(), "other-value".to_string());
+
+        dataset.update_config(desired_config.clone()).await.unwrap();
+        assert_eq!(dataset.manifest.config, desired_config);
+
+        desired_config.remove("other-key");
+        dataset.delete_config_keys(&["other-key"]).await.unwrap();
+        assert_eq!(dataset.manifest.config, desired_config);
     }
 
     #[rstest]
@@ -3124,6 +3417,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first_ver.version().version, 1);
+
+        // test update tag
+        let bad_tag_update = dataset.tags.update("tag3", 1).await;
+        assert_eq!(
+            bad_tag_update.err().unwrap().to_string(),
+            "Ref not found error: tag tag3 does not exist"
+        );
+
+        let another_bad_tag_update = dataset.tags.update("tag1", 3).await;
+        assert_eq!(
+            another_bad_tag_update.err().unwrap().to_string(),
+            "Version not found error: version 3 does not exist"
+        );
+
+        dataset.tags.update("tag1", 2).await.unwrap();
+        dataset = dataset.checkout_version("tag1").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        dataset.tags.update("tag1", 1).await.unwrap();
+        dataset = dataset.checkout_version("tag1").await.unwrap();
+        assert_eq!(dataset.manifest.version, 1);
     }
 
     #[rstest]
@@ -3777,6 +4091,64 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_overwrite_mixed_version() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let arr = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        let data = RecordBatch::try_new(schema.clone(), vec![arr]).unwrap();
+        let reader =
+            RecordBatchIterator::new(vec![data.clone()].into_iter().map(Ok), schema.clone());
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()
+                .unwrap(),
+            LanceFileVersion::Legacy
+        );
+
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()
+                .unwrap(),
+            LanceFileVersion::Legacy
+        );
+    }
+
     // Bug: https://github.com/lancedb/lancedb/issues/1223
     #[tokio::test]
     async fn test_open_nonexisting_dataset() {
@@ -3855,5 +4227,41 @@ mod tests {
             ds2.latest_version_id().await.unwrap(),
             dataset.latest_version_id().await.unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create() {
+        async fn write(uri: &str) -> Result<()> {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+            let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+            Dataset::write(empty_reader, uri, None).await?;
+            Ok(())
+        }
+
+        for _ in 0..5 {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            let (res1, res2) = tokio::join!(write(test_uri), write(test_uri));
+
+            assert!(res1.is_ok() || res2.is_ok());
+            if res1.is_err() {
+                assert!(
+                    matches!(res1, Err(Error::DatasetAlreadyExists { .. })),
+                    "{:?}",
+                    res1
+                );
+            } else {
+                assert!(
+                    matches!(res2, Err(Error::DatasetAlreadyExists { .. })),
+                    "{:?}",
+                    res2
+                );
+            }
+        }
     }
 }

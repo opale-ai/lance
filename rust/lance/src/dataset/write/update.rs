@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use super::super::utils::make_rowid_capture_stream;
-use super::write_fragments_internal;
+use super::{write_fragments_internal, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
@@ -18,6 +18,7 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
@@ -185,6 +186,12 @@ impl UpdateBuilder {
 // TODO: support distributed operation.
 
 #[derive(Debug, Clone)]
+pub struct UpdateResult {
+    pub new_dataset: Arc<Dataset>,
+    pub rows_updated: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
@@ -192,7 +199,7 @@ pub struct UpdateJob {
 }
 
 impl UpdateJob {
-    pub async fn execute(self) -> Result<Arc<Dataset>> {
+    pub async fn execute(self) -> Result<UpdateResult> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
 
@@ -223,7 +230,7 @@ impl UpdateJob {
                 let updates = updates_ref.clone();
                 tokio::task::spawn_blocking(move || Self::apply_updates(batch?, updates))
             })
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
@@ -231,16 +238,20 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
+        let version = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
         let new_fragments = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema(),
             Box::pin(stream),
-            Default::default(),
+            WriteParams::with_storage_version(version),
         )
         .await?;
-
         // Apply deletions
         let removed_row_ids = Arc::into_inner(removed_row_ids)
             .unwrap()
@@ -248,9 +259,18 @@ impl UpdateJob {
             .unwrap();
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
 
+        let num_updated_rows = new_fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap() as u64)
+            .sum::<u64>();
         // Commit updated and new fragments
-        self.commit(removed_fragment_ids, old_fragments, new_fragments)
-            .await
+        let new_dataset = self
+            .commit(removed_fragment_ids, old_fragments, new_fragments)
+            .await?;
+        Ok(UpdateResult {
+            new_dataset,
+            rows_updated: num_updated_rows,
+        })
     }
 
     fn apply_updates(
@@ -301,7 +321,7 @@ impl UpdateJob {
                     }
                 }
             })
-            .buffer_unordered(num_cpus::get() * 4);
+            .buffer_unordered(self.dataset.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -334,6 +354,7 @@ impl UpdateJob {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.dataset.manifest_naming_scheme,
         )
         .await?;
 
@@ -354,6 +375,8 @@ mod tests {
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
+    use lance_file::version::LanceFileVersion;
+    use rstest::rstest;
     use tempfile::{tempdir, TempDir};
 
     /// Returns a dataset with 3 fragments, each with 10 rows.
@@ -361,7 +384,7 @@ mod tests {
     /// Also returns the TempDir, which should be kept alive as long as the
     /// dataset is being accessed. Once that is dropped, the temp directory is
     /// deleted.
-    async fn make_test_dataset() -> (Arc<Dataset>, TempDir) {
+    async fn make_test_dataset(version: LanceFileVersion) -> (Arc<Dataset>, TempDir) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -379,6 +402,7 @@ mod tests {
 
         let write_params = WriteParams {
             max_rows_per_file: 10,
+            data_storage_version: Some(version),
             ..Default::default()
         };
 
@@ -395,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_validation() {
-        let (dataset, _test_dir) = make_test_dataset().await;
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy).await;
 
         let builder = UpdateBuilder::new(dataset.clone());
 
@@ -429,11 +453,14 @@ mod tests {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_update_all() {
-        let (dataset, _test_dir) = make_test_dataset().await;
+    async fn test_update_all(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
+        let (dataset, _test_dir) = make_test_dataset(version).await;
 
-        let dataset = UpdateBuilder::new(dataset)
+        let update_result = UpdateBuilder::new(dataset)
             .set("name", "'bar' || cast(id as string)")
             .unwrap()
             .build()
@@ -442,6 +469,7 @@ mod tests {
             .await
             .unwrap();
 
+        let dataset = update_result.new_dataset;
         let actual_batches = dataset
             .scan()
             .try_into_stream()
@@ -468,13 +496,16 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 1);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_update_conditional() {
-        let (dataset, _test_dir) = make_test_dataset().await;
+    async fn test_update_conditional(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
+        let (dataset, _test_dir) = make_test_dataset(version).await;
 
         let original_fragments = dataset.get_fragments();
 
-        let dataset = UpdateBuilder::new(dataset)
+        let update_result = UpdateBuilder::new(dataset)
             .update_where("id >= 15")
             .unwrap()
             .set("name", "'bar' || cast(id as string)")
@@ -485,6 +516,7 @@ mod tests {
             .await
             .unwrap();
 
+        let dataset = update_result.new_dataset;
         let actual_batches = dataset
             .scan()
             .try_into_stream()
